@@ -1,0 +1,672 @@
+"""
+FC 온라인 전력분석실
+- 내 분석: 나 vs 같은 경기 상대 평균 비교 → 강점/약점, 질 때 공통점
+- 상대 스카우팅: 3초 스카우팅 카드(최근 10경기) + 내 기록과 겹쳐 본 매칭 전략
+데이터: 넥슨 Open API (https://openapi.nexon.com)
+실행: streamlit run app.py
+"""
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import requests
+import streamlit as st
+
+BASE = "https://open.api.nexon.com"
+QUICK_N = 10  # 스카우팅 카드용 경기 수
+st.set_page_config(page_title="FC 전력분석실", page_icon="⚽", layout="wide")
+
+
+# ================================================================ API
+class ApiError(Exception):
+    pass
+
+
+def _get(path, params, key):
+    for attempt in range(5):
+        r = requests.get(BASE + path, params=params,
+                         headers={"x-nxopen-api-key": key}, timeout=15)
+        if r.status_code == 429:  # 요청 한도 → 잠깐 쉬고 재시도
+            time.sleep(0.7 * (attempt + 1))
+            continue
+        if r.status_code != 200:
+            try:
+                msg = r.json().get("error", {}).get("message", r.text)
+            except Exception:
+                msg = r.text
+            raise ApiError(f"{r.status_code}: {msg}")
+        return r.json()
+    raise ApiError("요청 한도를 넘었어요. 잠시 후 다시 시도하세요.")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def meta(name):
+    r = requests.get(f"{BASE}/static/fconline/meta/{name}.json", timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_ouid(nick, key):
+    return _get("/fconline/v1/id", {"nickname": nick}, key)["ouid"]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_maxdiv(ouid, key):
+    return _get("/fconline/v1/user/maxdivision", {"ouid": ouid}, key)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_matches(ouid, mtype, limit, key):
+    return _get("/fconline/v1/user/match",
+                {"ouid": ouid, "matchtype": mtype, "offset": 0, "limit": limit}, key)
+
+
+@st.cache_resource
+def detail_store():
+    return {}  # 경기 상세 캐시 (경기 기록은 바뀌지 않으니 계속 재사용)
+
+
+def fetch_details(ids, key, label):
+    """여러 경기 상세를 동시에 불러와서 로딩 시간을 줄임."""
+    store = detail_store()
+    todo = [m for m in ids if m not in store]
+    if todo:
+        bar = st.progress(0.0, text=label)
+
+        def work(mid):
+            try:
+                return mid, _get("/fconline/v1/match-detail", {"matchid": mid}, key)
+            except ApiError:
+                return mid, None
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futs = [ex.submit(work, m) for m in todo]
+            for i, f in enumerate(as_completed(futs), 1):
+                mid, d = f.result()
+                if d:
+                    store[mid] = d
+                bar.progress(i / len(todo), text=f"{label} ({i}/{len(todo)})")
+        bar.empty()
+    return [store[m] for m in ids if m in store]
+
+
+# ================================================================ 지표 정의
+# (키, 이름, 높을수록 좋은가)
+PERF = [
+    ("win", "승률(%)", True),
+    ("gf", "경기당 득점", True),
+    ("ga", "경기당 실점", False),
+    ("shots", "슈팅 수", True),
+    ("sot_rate", "유효슈팅 비율(%)", True),
+    ("conv", "슈팅 대비 득점(%)", True),
+    ("shots_against", "허용 슈팅", False),
+    ("sot_against", "허용 유효슈팅", False),
+    ("pass_rate", "패스 성공률(%)", True),
+    ("through_rate", "스루패스 성공률(%)", True),
+    ("tackle_rate", "태클 성공률(%)", True),
+    ("block_rate", "블록 성공률(%)", True),
+    ("rating", "평균 평점", True),
+    ("fouls", "파울", False),
+]
+STYLE = [
+    ("poss", "점유율(%)"),
+    ("box_share", "박스 안 슈팅 비중(%)"),
+    ("head_share", "헤딩 슈팅 비중(%)"),
+    ("long_share", "롱패스 비중(%)"),
+    ("through_try", "스루패스 시도"),
+    ("offside", "오프사이드"),
+]
+LABEL = {k: l for k, l, _ in PERF} | dict(STYLE)
+
+TIP_SELF_WEAK = {
+    "win": "승률이 같은 구간 상대들보다 낮아요. 아래 세부 약점부터 하나씩 잡아 보세요.",
+    "gf": "득점이 부족해요. 찬스 창출과 마무리 중 어디서 막히는지 슈팅 지표를 같이 보세요.",
+    "ga": "실점이 많아요. 수비 라인 간격, 무리한 태클 타이밍을 점검해 보세요.",
+    "shots": "슈팅까지 가는 전개가 적어요. 빌드업이 마무리로 이어지지 않고 있어요.",
+    "sot_rate": "슈팅이 골문을 자주 벗어나요. 각도 없는 슈팅, 급한 슈팅을 줄여 보세요.",
+    "conv": "찬스 대비 마무리가 약해요. 무리한 중거리보다 박스 안에서 한 번 더 연결해 보세요.",
+    "shots_against": "슈팅을 많이 허용해요. 박스 앞 공간 커버가 늦는지 확인해 보세요.",
+    "sot_against": "유효슈팅을 많이 허용해요. 슈팅 각도를 좁히는 수비 위치를 신경 써 보세요.",
+    "pass_rate": "패스 미스가 잦아요. 압박을 받을 때 짧고 안전한 선택을 늘려 보세요.",
+    "through_rate": "스루패스 성공률이 낮아요. 뒷공간이 확실히 열렸을 때만 시도해 보세요.",
+    "tackle_rate": "태클 실패가 많아요. 태클보다 컨테인과 위치 선정으로 막는 비중을 늘려 보세요.",
+    "block_rate": "블록 성공률이 낮아요. 슈팅 코스 앞에 몸을 두는 타이밍이 늦을 수 있어요.",
+    "rating": "선수 평균 평점이 낮아요. 아래 선수별 표에서 평점이 낮은 선수를 확인해 보세요.",
+    "fouls": "파울이 많아요. 박스 근처 프리킥과 카드 리스크가 커집니다.",
+}
+TIP_SCOUT_WEAK = {  # 상대 약점 → 공략 포인트
+    "ga": "실점이 많은 상대. 초반부터 적극적으로 두드려",
+    "shots_against": "슈팅을 쉽게 내줌. 박스 앞에서 과감하게 슈팅",
+    "sot_against": "유효슈팅을 쉽게 내줌. 기회 오면 망설이지 말고 슈팅",
+    "pass_rate": "패스 미스가 잦음. 전방 압박이 잘 통함",
+    "tackle_rate": "태클 실패가 많음. 드리블 돌파와 개인기가 유효",
+    "block_rate": "블록이 약함. 중거리 슈팅도 가치 있음",
+    "fouls": "파울이 많음. 박스 근처 드리블로 프리킥 유도",
+    "conv": "마무리가 약함. 박스 안 결정적 찬스만 막으면 됨",
+    "sot_rate": "슈팅 정확도가 낮음. 먼 거리 슈팅은 내줘도 부담 적음",
+    "through_rate": "스루패스가 잘 안 통함. 라인을 조금 올려도 됨",
+    "shots": "공격 전개가 둔함. 라인 올려 압박해도 역습 위험 낮음",
+    "win": "최근 폼이 안 좋음. 초반 기세로 밀어붙이기 좋음",
+    "gf": "득점력이 낮음. 선제골 넣으면 유리하게 흘러감",
+}
+TIP_SCOUT_STRONG = {  # 상대 강점 → 주의할 점
+    "conv": "결정력이 좋음. 박스 안 슈팅 공간을 절대 내주지 마",
+    "sot_rate": "슈팅이 정확함. 슈팅 각도를 끝까지 좁혀",
+    "gf": "득점력이 높음. 선제 실점만은 피하는 운영",
+    "through_rate": "스루패스가 잘 통함. 수비 라인 너무 올리지 마",
+    "tackle_rate": "태클이 좋음. 무리한 드리블보다 원투 패스",
+    "pass_rate": "빌드업이 안정적. 무리한 압박보다 지역 수비",
+    "ga": "수비가 단단함. 급하게 두드리지 말고 기다려",
+    "sot_against": "유효슈팅을 잘 안 내줌. 확실한 찬스까지 연결",
+    "block_rate": "블록을 잘함. 중거리보다 침투 위주로",
+    "shots": "슈팅을 많이 만듦. 박스 앞 수비 숫자 늘리기",
+    "win": "최근 폼이 좋음. 초반 실점 조심",
+}
+
+# 3) 매칭 전략: (내 강점 키, 상대 약점 키, 전략)
+MATCHUP = [
+    ("through_rate", "ga", "내 스루패스가 잘 통하고 상대는 실점이 많아. 뒷공간 침투 위주로 공격해"),
+    ("through_rate", "shots_against", "내 스루패스 + 상대는 슈팅을 쉽게 내줘. 라인 뒤로 찔러서 슈팅까지 가져가"),
+    ("conv", "sot_against", "내 결정력이 좋고 상대는 유효슈팅을 쉽게 내줘. 찬스 오면 바로 마무리해"),
+    ("sot_rate", "block_rate", "내 슈팅이 정확하고 상대 블록이 약해. 박스 앞 중거리도 적극적으로"),
+    ("tackle_rate", "pass_rate", "내 태클이 좋고 상대는 패스 미스가 잦아. 전방 압박으로 공 뺏어"),
+    ("pass_rate", "tackle_rate", "내 패스가 안정적이고 상대 태클이 약해. 짧게 풀다가 드리블로 파고들어"),
+    ("sot_against", "conv", "내가 슈팅 각을 잘 막고 상대 결정력이 약해. 수비 안정 후 역습"),
+    ("ga", "shots", "내 수비가 단단하고 상대 공격 전개가 둔해. 라인 올려 점유하며 압박"),
+    ("shots", "shots_against", "내가 슈팅을 많이 만들고 상대는 많이 허용해. 슈팅 수로 밀어붙여"),
+    ("gf", "ga", "내 득점력이 좋고 상대 실점이 많아. 공격적으로 운영해도 돼"),
+]
+# (상대 강점 키, 내 약점 키, 경고)
+RISK = [
+    ("conv", "shots_against", "상대 결정력이 좋은데 나는 슈팅 허용이 많아. 박스 앞 공간 차단이 최우선"),
+    ("conv", "sot_against", "상대 결정력이 좋은데 나는 유효슈팅 허용이 많아. 슈팅 각 좁히기에 집중"),
+    ("through_rate", "ga", "상대 스루패스가 잘 통하고 내 실점이 많은 편. 라인을 한 칸 내려"),
+    ("tackle_rate", "pass_rate", "상대 태클이 좋고 내 패스 미스가 잦아. 무리한 전진 패스 대신 안전하게"),
+    ("pass_rate", "tackle_rate", "상대 빌드업이 좋고 내 태클 성공률이 낮아. 태클보다 컨테인으로 버텨"),
+    ("gf", "ga", "상대 득점력이 높고 내 실점도 많은 편. 선제 실점만은 피해"),
+    ("shots", "shots_against", "상대가 슈팅을 많이 만들고 나는 많이 허용해. 박스 앞 수비 숫자 늘려"),
+    ("ga", "conv", "상대 수비가 단단하고 내 마무리가 약해. 슈팅 전에 한 번 더 연결해서 확실한 찬스로"),
+]
+
+CONTROLLER = {"keyboard": "키보드", "gamepad": "패드", "pad": "패드"}
+LOSS_EXCLUDE = {"win", "gf", "ga", "conv", "rating"}  # 지면 당연히 나빠지는 지표 제외
+
+
+def sdiv(a, b):
+    return a / b * 100 if b else np.nan
+
+
+def goals(side):
+    sh = side.get("shoot") or {}
+    return sh.get("goalTotalDisplay", sh.get("goalTotal", 0)) or 0
+
+
+def side_metrics(s, o):
+    md = s.get("matchDetail") or {}
+    sh = s.get("shoot") or {}
+    ps = s.get("pass") or {}
+    df = s.get("defence") or {}
+    osh = o.get("shoot") or {}
+    shots = sh.get("shootTotal", 0) or 0
+    ptry = ps.get("passTry", 0) or 0
+    return {
+        "win": 100.0 if md.get("matchResult") == "승" else 0.0,
+        "gf": goals(s),
+        "ga": goals(o),
+        "shots": shots,
+        "sot_rate": sdiv(sh.get("effectiveShootTotal", 0), shots),
+        "conv": sdiv(sh.get("goalTotal", 0), shots),
+        "shots_against": osh.get("shootTotal", 0),
+        "sot_against": osh.get("effectiveShootTotal", 0),
+        "pass_rate": sdiv(ps.get("passSuccess", 0), ptry),
+        "through_rate": sdiv(ps.get("throughPassSuccess", 0), ps.get("throughPassTry", 0)),
+        "tackle_rate": sdiv(df.get("tackleSuccess", 0), df.get("tackleTry", 0)),
+        "block_rate": sdiv(df.get("blockSuccess", 0), df.get("blockTry", 0)),
+        "rating": md.get("averageRating", np.nan),
+        "fouls": md.get("foul", 0),
+        "poss": md.get("possession", np.nan),
+        "box_share": sdiv(sh.get("shootInPenalty", 0), shots),
+        "head_share": sdiv(sh.get("shootHeading", 0), shots),
+        "long_share": sdiv(ps.get("longPassTry", 0), ptry),
+        "through_try": ps.get("throughPassTry", 0),
+        "offside": md.get("OffsideCount", 0),
+    }
+
+
+PLAYER_KEYS = ["goal", "assist", "shoot", "effectiveShoot", "spRating", "passTry",
+               "passSuccess", "dribbleTry", "dribbleSuccess", "tackleTry", "tackle"]
+
+
+# ================================================================ 분석
+def compare(me, bm):
+    """경기별 (대상 - 그 경기 상대) 차이로 효과크기 계산. 양수 = 좋은 쪽."""
+    out = []
+    for k, label, higher_better in PERF:
+        a, b = me[k].astype(float), bm[k].astype(float)
+        diff = (a - b).dropna()
+        if len(diff) < 3:
+            continue
+        sd = diff.std(ddof=1)
+        eff = diff.mean() / sd if sd and sd > 0 else 0.0
+        if not higher_better:
+            eff = -eff
+        out.append({"key": k, "지표": label, "대상": a.mean(), "비교 평균": b.mean(),
+                    "차이": a.mean() - b.mean(), "효과": eff})
+    return pd.DataFrame(out)
+
+
+def goal_minute(gt):
+    period, sec = gt >> 24, (gt & 0xFFFFFF) / 60
+    base = {0: 0, 1: 45, 2: 90, 3: 105}.get(period, 120)
+    return sec if sec >= base else base + sec
+
+
+BINS = [-1, 15, 30, 45, 60, 75, 90, 200]
+BIN_LABELS = ["0-15분", "16-30분", "31-45분", "46-60분", "61-75분", "76-90분", "90분+"]
+
+
+def timing(shots):
+    mins = [goal_minute(s.get("goalTime", 0)) for s in shots
+            if s.get("result") == 3 and (s.get("goalTime", 0) >> 24) < 4]
+    cut = pd.cut(pd.Series(mins, dtype=float), BINS, labels=BIN_LABELS)
+    return cut.value_counts().reindex(BIN_LABELS, fill_value=0).astype(float)
+
+
+def style_tags(me, bm):
+    tags = []
+    poss = me["poss"].mean()
+    tags.append("점유형" if poss >= 55 else "역습형" if poss <= 45 else "밸런스형")
+    box = me["box_share"].mean()
+    if box >= 70:
+        tags.append("박스 안 침투 선호")
+    elif box <= 50:
+        tags.append("중거리 슈팅 많음")
+    if me["head_share"].mean() >= 20:
+        tags.append("크로스·헤딩 의존")
+    if me["long_share"].mean() >= 15:
+        tags.append("롱패스 많음")
+    if bm["through_try"].mean() and me["through_try"].mean() >= 1.3 * bm["through_try"].mean():
+        tags.append("스루패스 적극 활용")
+    if me["offside"].mean() >= 2:
+        tags.append("뒷공간 침투 성향")
+    return tags
+
+
+def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
+    """닉네임 → 분석 결과 dict. 실패하면 에러 문자열."""
+    try:
+        ouid = get_ouid(nick.strip(), key)
+    except ApiError as e:
+        return f"'{nick}' 닉네임을 찾지 못했어요. 철자를 확인하세요. ({e})"
+    try:
+        ids = get_matches(ouid, mtype, n, key)
+    except ApiError as e:
+        return f"경기 목록을 불러오지 못했어요. API 키와 경기 종류를 확인하세요. ({e})"
+    details = fetch_details(ids, key, label)
+    details.sort(key=lambda d: d.get("matchDate", ""), reverse=True)
+
+    me_rows, op_rows, me_shots, op_shots, players, ctrls = [], [], [], [], [], []
+    for d in details:
+        info = d.get("matchInfo") or []
+        if len(info) != 2:
+            continue
+        me = next((x for x in info if x.get("ouid") == ouid), None)
+        if me is None:
+            continue
+        op = info[1] if info[0] is me else info[0]
+        md = me.get("matchDetail") or {}
+        if md.get("matchEndType", 0) != 0:
+            continue  # 몰수승/몰수패 제외
+        idx = len(me_rows)
+        m = side_metrics(me, op)
+        m.update(idx=idx, date=d.get("matchDate", "")[:16].replace("T", " "),
+                 opp=op.get("nickname"), score=f"{goals(me)} : {goals(op)}",
+                 result=md.get("matchResult"))
+        me_rows.append(m)
+        op_rows.append(side_metrics(op, me))
+        me_shots += [{**s, "_m": idx} for s in me.get("shootDetail") or []]
+        op_shots += [{**s, "_m": idx} for s in op.get("shootDetail") or []]
+        if md.get("controller"):
+            ctrls.append(md["controller"])
+        for p in me.get("player") or []:
+            stt = p.get("status") or {}
+            if p.get("spPosition") == 28 or not stt.get("spRating"):
+                continue
+            players.append({"spId": p.get("spId"), "pos": p.get("spPosition"),
+                            **{k: stt.get(k, 0) for k in PLAYER_KEYS}})
+    if len(me_rows) < 3:
+        return f"'{nick}'의 분석 가능한 경기가 3경기 미만이에요. 경기 종류를 바꾸거나 경기 수를 늘려 보세요."
+
+    me_df, bm_df = pd.DataFrame(me_rows), pd.DataFrame(op_rows)
+    ctrl = pd.Series(ctrls).mode().iat[0] if ctrls else None
+    return {"nick": nick, "ouid": ouid, "me": me_df, "bm": bm_df,
+            "me_shots": me_shots, "op_shots": op_shots, "players": pd.DataFrame(players),
+            "cmp": compare(me_df, bm_df), "tags": style_tags(me_df, bm_df),
+            "controller": CONTROLLER.get(str(ctrl).lower(), ctrl) if ctrl else None}
+
+
+def loss_pattern(r):
+    """2) 진 경기 vs 이긴 경기 비교."""
+    me = r["me"]
+    W, L = me[me.result == "승"], me[me.result == "패"]
+    if len(W) < 3 or len(L) < 3:
+        return None
+    items = []
+    keys = [(k, l, hb) for k, l, hb in PERF if k not in LOSS_EXCLUDE] + \
+           [(k, l, None) for k, l in STYLE]
+    for k, label, hb in keys:
+        a, b = W[k].astype(float).dropna(), L[k].astype(float).dropna()
+        if len(a) < 3 or len(b) < 3:
+            continue
+        sp = np.sqrt((a.var(ddof=1) + b.var(ddof=1)) / 2)
+        if not sp:
+            continue
+        d = (b.mean() - a.mean()) / sp
+        if abs(d) >= 0.5:
+            items.append({"지표": label, "이긴 경기": a.mean(), "진 경기": b.mean(),
+                          "d": d, "hb": hb})
+    items.sort(key=lambda x: -abs(x["d"]))
+
+    wi, li = set(W.idx), set(L.idx)
+    tw = timing([s for s in r["op_shots"] if s["_m"] in wi]) / len(W)
+    tl = timing([s for s in r["op_shots"] if s["_m"] in li]) / len(L)
+    gap = tl - tw
+    bucket = gap.idxmax() if gap.max() > 0.15 else None
+    return {"items": items[:5], "bucket": bucket,
+            "tl": tl[bucket] if bucket else 0, "tw": tw[bucket] if bucket else 0,
+            "nw": len(W), "nl": len(L)}
+
+
+def matchup(mine, opp):
+    """3) 내 강점 × 상대 약점 → 전략, 상대 강점 × 내 약점 → 경고."""
+    me = dict(zip(mine["cmp"].key, mine["cmp"].효과))
+    op = dict(zip(opp["cmp"].key, opp["cmp"].효과))
+    plans = sorted([(me.get(a, 0) - op.get(b, 0), t) for a, b, t in MATCHUP
+                    if me.get(a, 0) >= 0.2 and op.get(b, 0) <= -0.2], reverse=True)
+    risks = sorted([(op.get(a, 0) - me.get(b, 0), t) for a, b, t in RISK
+                    if op.get(a, 0) >= 0.2 and me.get(b, 0) <= -0.2], reverse=True)
+    extra = []
+    my_style, op_style = mine["tags"][0], opp["tags"][0]
+    if op_style == "역습형" and my_style == "점유형":
+        extra.append("상대는 역습형이고 나는 점유형. 점유할 때 뒷공간 커버를 남겨둬")
+    elif op_style == "점유형" and my_style == "역습형":
+        extra.append("상대는 점유형이고 나는 역습형. 내 스타일대로 받아치기 좋은 매치업")
+    return [t for _, t in plans[:2]], [t for _, t in risks[:2]], extra
+
+
+def fmt(v):
+    return "-" if pd.isna(v) else f"{v:.1f}"
+
+
+# ================================================================ 시각화
+CARD_CSS = """
+<style>
+.sc-card{border:2px solid #1f8a5b;border-radius:14px;padding:18px 22px;margin:8px 0 16px}
+.sc-head{font-size:1.05rem;opacity:.75;margin-bottom:6px}
+.sc-style{font-size:1.9rem;font-weight:800;margin-bottom:12px;line-height:1.25}
+.sc-row{font-size:1.35rem;line-height:1.45;margin:8px 0}
+.sc-tag{display:inline-block;min-width:3.2em;font-weight:800}
+.sc-go{color:#1f8a5b}.sc-no{color:#d0463b}.sc-plan{color:#3b7dd8}
+.sc-foot{font-size:.95rem;opacity:.7;margin-top:10px}
+</style>
+"""
+
+
+def scout_card(opp, mine=None):
+    cmp_df = opp["cmp"]
+    weak = cmp_df[cmp_df.효과 <= -0.3].sort_values("효과")
+    strong = cmp_df[cmp_df.효과 >= 0.3].sort_values("효과", ascending=False)
+    attack = next((TIP_SCOUT_WEAK[k] for k in weak.key if k in TIP_SCOUT_WEAK),
+                  "뚜렷한 약점 없음. 내 스타일대로 운영")
+    caution = next((TIP_SCOUT_STRONG[k] for k in strong.key if k in TIP_SCOUT_STRONG),
+                   "뚜렷한 강점 없음")
+    me = opp["me"]
+    w, dr = (me.result == "승").sum(), (me.result == "무").sum()
+    l = len(me) - w - dr
+    head = f"{opp['nick']} · 최근 {len(me)}경기 {w}승 {dr}무 {l}패"
+    if opp["controller"]:
+        head += f" · {opp['controller']}"
+
+    rows = [f'<div class="sc-row"><span class="sc-tag sc-go">공략</span>{attack}</div>',
+            f'<div class="sc-row"><span class="sc-tag sc-no">주의</span>{caution}</div>']
+    if mine:
+        plans, risks, extra = matchup(mine, opp)
+        for t in plans[:1] + extra[:1]:
+            rows.append(f'<div class="sc-row"><span class="sc-tag sc-plan">전략</span>{t}</div>')
+        for t in risks[:1]:
+            rows.append(f'<div class="sc-row"><span class="sc-tag sc-no">경고</span>{t}</div>')
+
+    foot = ""
+    t_conc = timing(opp["op_shots"])
+    if t_conc.max() > 0:
+        foot = f'<div class="sc-foot">상대가 가장 많이 실점하는 구간: {t_conc.idxmax()}</div>'
+    st.markdown(CARD_CSS + f'<div class="sc-card"><div class="sc-head">{head}</div>'
+                f'<div class="sc-style">{" · ".join(opp["tags"][:3])}</div>'
+                + "".join(rows) + foot + "</div>", unsafe_allow_html=True)
+
+
+def radar(cmp_df, name):
+    cats = cmp_df["지표"].tolist()
+    vals = (50 + 25 * cmp_df["효과"]).clip(0, 100).tolist()
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(r=[50] * (len(cats) + 1), theta=cats + cats[:1],
+                                  name="비교 평균", line=dict(dash="dot", color="#8a8f98")))
+    fig.add_trace(go.Scatterpolar(r=vals + vals[:1], theta=cats + cats[:1], name=name,
+                                  fill="toself", line=dict(color="#1f8a5b")))
+    fig.update_layout(polar=dict(radialaxis=dict(range=[0, 100], showticklabels=False)),
+                      height=420, margin=dict(l=40, r=40, t=30, b=30),
+                      legend=dict(orientation="h", y=-0.1))
+    return fig
+
+
+def shot_map(shots, title):
+    color = {1: "#3b7dd8", 2: "#b0b4ba", 3: "#1f8a5b"}
+    name = {1: "유효슈팅", 2: "빗나감", 3: "골"}
+    fig = go.Figure()
+    fig.add_shape(type="rect", x0=0.5, y0=0, x1=1, y1=1, line=dict(color="#6b7280"))
+    fig.add_shape(type="rect", x0=0.843, y0=0.204, x1=1, y1=0.796, line=dict(color="#6b7280"))
+    fig.add_shape(type="rect", x0=0.948, y0=0.368, x1=1, y1=0.632, line=dict(color="#6b7280"))
+    for res in (2, 1, 3):
+        pts = [s for s in shots if s.get("result") == res]
+        if pts:
+            fig.add_trace(go.Scatter(x=[p.get("x") for p in pts], y=[p.get("y") for p in pts],
+                                     mode="markers", name=name[res],
+                                     marker=dict(color=color[res], size=9 if res == 3 else 7,
+                                                 opacity=0.85)))
+    fig.update_layout(title=title, height=380, xaxis=dict(range=[0.48, 1.02], visible=False),
+                      yaxis=dict(range=[-0.02, 1.02], visible=False, scaleanchor="x"),
+                      margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
+    return fig
+
+
+def player_table(pdf):
+    if pdf.empty:
+        return pdf
+    names = {x["id"]: x["name"] for x in meta("spid")}
+    pos = {x["spposition"]: x["desc"] for x in meta("spposition")}
+    g = pdf.groupby("spId")
+    t = g.agg(경기=("spRating", "size"), 평점=("spRating", "mean"), 골=("goal", "sum"),
+              도움=("assist", "sum"), 슈팅=("shoot", "sum"), 유효슈팅=("effectiveShoot", "sum"),
+              패스시도=("passTry", "sum"), 패스성공=("passSuccess", "sum"),
+              드리블시도=("dribbleTry", "sum"), 드리블성공=("dribbleSuccess", "sum"),
+              태클시도=("tackleTry", "sum"), 태클성공=("tackle", "sum"))
+    t.insert(0, "포지션", g["pos"].agg(lambda s: pos.get(int(s.mode().iat[0]), "?")))
+    t["패스성공률"] = t.패스성공 / t.패스시도.replace(0, np.nan) * 100
+    t["드리블성공률"] = t.드리블성공 / t.드리블시도.replace(0, np.nan) * 100
+    t["태클성공률"] = t.태클성공 / t.태클시도.replace(0, np.nan) * 100
+    t.index = [names.get(i, str(i)) for i in t.index]
+    cols = ["포지션", "경기", "평점", "골", "도움", "슈팅", "유효슈팅",
+            "패스성공률", "드리블성공률", "태클성공률"]
+    return t[cols].sort_values("평점", ascending=False).round(2)
+
+
+def render_loss(r, mode):
+    st.subheader("질 때 공통점" if mode == "self" else "상대가 질 때 공통점")
+    lp = loss_pattern(r)
+    if lp is None:
+        st.write("이긴 경기와 진 경기가 각각 3경기 이상 있어야 비교할 수 있어요. 경기 수를 늘려 보세요.")
+        return
+    st.caption(f"이긴 {lp['nw']}경기와 진 {lp['nl']}경기를 비교했어요. "
+               "지면 당연히 나빠지는 득점·실점·승률은 빼고 봤어요.")
+    if not lp["items"] and not lp["bucket"]:
+        st.write("이긴 경기와 진 경기 사이에 뚜렷한 차이가 없어요. 패배가 특정 패턴보다는 경기마다 다른 이유로 나오고 있어요.")
+    for it in lp["items"]:
+        arrow = "높아요" if it["진 경기"] > it["이긴 경기"] else "낮아요"
+        st.markdown(f"- 진 경기에서 **{it['지표']}**이(가) {arrow}: "
+                    f"이긴 경기 {fmt(it['이긴 경기'])} → 진 경기 {fmt(it['진 경기'])}")
+    if lp["bucket"]:
+        st.markdown(f"- 진 경기에서는 **{lp['bucket']}** 실점이 특히 많아요: "
+                    f"경기당 {lp['tw']:.2f}골 → {lp['tl']:.2f}골")
+
+
+def render_full(r, mode):
+    me, bm, cmp_df = r["me"], r["bm"], r["cmp"]
+    nick = r["nick"]
+    try:
+        divs = {d["divisionId"]: d["divisionName"] for d in meta("division")}
+        best = next((d for d in get_maxdiv(r["ouid"], st.session_state.api_key)
+                     if d.get("matchType") == st.session_state.mtype), None)
+        best_txt = divs.get(best["division"], "-") if best else "-"
+    except Exception:
+        best_txt = "-"
+    w, dr = (me.result == "승").sum(), (me.result == "무").sum()
+    l = len(me) - w - dr
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("분석 경기", f"{len(me)}경기")
+    c2.metric("전적", f"{w}승 {dr}무 {l}패")
+    c3.metric("평균 스코어", f"{me.gf.mean():.1f} : {me.ga.mean():.1f}")
+    c4.metric("역대 최고 등급", best_txt)
+    st.caption("비교 기준은 같은 경기에서 만난 상대들의 평균이에요. "
+               "매칭은 실력대가 비슷한 상대끼리 잡히므로, 같은 구간 유저 평균에 가까운 기준입니다.")
+
+    strong = cmp_df[cmp_df.효과 >= 0.3].sort_values("효과", ascending=False)
+    weak = cmp_df[cmp_df.효과 <= -0.3].sort_values("효과")
+    left, right = st.columns([1.1, 1])
+    with left:
+        st.plotly_chart(radar(cmp_df, nick), use_container_width=True)
+    with right:
+        st.subheader("플레이 스타일")
+        st.write(" / ".join(r["tags"]) + (f" / {r['controller']}" if r["controller"] else ""))
+        st.subheader("강점" if mode == "self" else "주의할 점 (상대 강점)")
+        if strong.empty:
+            st.write("비교 평균보다 뚜렷하게 앞서는 지표는 없어요.")
+        for _, x in strong.iterrows():
+            line = f"**{x.지표}** {fmt(x.대상)} (평균 {fmt(x['비교 평균'])})"
+            if mode == "scout" and x.key in TIP_SCOUT_STRONG:
+                line += f" — {TIP_SCOUT_STRONG[x.key]}"
+            st.markdown("- " + line)
+        st.subheader("약점" if mode == "self" else "공략 포인트 (상대 약점)")
+        if weak.empty:
+            st.write("비교 평균보다 뚜렷하게 뒤처지는 지표는 없어요.")
+        tips = TIP_SELF_WEAK if mode == "self" else TIP_SCOUT_WEAK
+        for _, x in weak.iterrows():
+            line = f"**{x.지표}** {fmt(x.대상)} (평균 {fmt(x['비교 평균'])})"
+            if x.key in tips:
+                line += f" — {tips[x.key]}"
+            st.markdown("- " + line)
+
+    render_loss(r, mode)
+
+    st.subheader("시간대별 득점·실점 (경기당)")
+    tdf = pd.DataFrame({"득점": timing(r["me_shots"]), "실점": timing(r["op_shots"])}) / len(me)
+    st.bar_chart(tdf, color=["#1f8a5b", "#d0463b"])
+
+    s1, s2 = st.columns(2)
+    s1.plotly_chart(shot_map(r["me_shots"], "슈팅 위치"), use_container_width=True)
+    s2.plotly_chart(shot_map(r["op_shots"], "허용한 슈팅 위치"), use_container_width=True)
+
+    with st.expander("전체 지표 비교표"):
+        show = cmp_df[["지표", "대상", "비교 평균", "차이", "효과"]].copy()
+        show.columns = ["지표", nick, "비교 평균", "차이", "효과크기 (+ 좋음)"]
+        st.dataframe(show.round(2), hide_index=True, use_container_width=True)
+        sty = pd.DataFrame({"지표": [LABEL[k] for k, _ in STYLE],
+                            nick: [me[k].mean() for k, _ in STYLE],
+                            "비교 평균": [bm[k].mean() for k, _ in STYLE]}).round(1)
+        st.dataframe(sty, hide_index=True, use_container_width=True)
+    with st.expander("선수별 기록"):
+        st.dataframe(player_table(r["players"]), use_container_width=True)
+    with st.expander("최근 경기"):
+        st.dataframe(me[["date", "opp", "score", "result"]]
+                     .rename(columns={"date": "일시", "opp": "상대", "score": "스코어",
+                                      "result": "결과"}),
+                     hide_index=True, use_container_width=True)
+
+
+# ================================================================ 화면
+st.title("FC 전력분석실")
+
+with st.sidebar:
+    default_key = os.environ.get("NEXON_API_KEY", "")
+    try:
+        default_key = default_key or st.secrets.get("NEXON_API_KEY", "")
+    except Exception:
+        pass
+    api_key = st.text_input("넥슨 Open API 키", value=default_key, type="password",
+                            help="openapi.nexon.com 에서 FC온라인 애플리케이션을 등록하면 발급돼요.")
+    try:
+        mtypes = {m["desc"]: m["matchtype"] for m in meta("matchtype")}
+    except Exception:
+        mtypes = {"공식경기": 50, "감독모드": 52, "친선경기": 40}
+    names = list(mtypes)
+    mname = st.selectbox("경기 종류", names,
+                         index=names.index("공식경기") if "공식경기" in names else 0)
+    n_games = st.slider("상세 분석 경기 수", 10, 100, 30, step=10)
+
+if not api_key:
+    st.info("왼쪽 사이드바에 넥슨 Open API 키를 입력하세요.")
+    st.stop()
+st.session_state.api_key = api_key
+st.session_state.mtype = mtypes[mname]
+MT = mtypes[mname]
+
+tab_scout, tab_me = st.tabs(["상대 스카우팅", "내 분석"])
+
+with tab_scout:
+    c1, c2 = st.columns([2, 1])
+    onick = c1.text_input("상대 닉네임", key="op_nick",
+                          placeholder="로딩 화면에 뜬 상대 닉네임")
+    my_nick = c2.text_input("내 닉네임 (전략 추천용)", key="my_nick_scout",
+                            value=st.session_state.get("saved_me", ""))
+    if st.button("스카우팅", key="op_btn", type="primary", use_container_width=True) and onick:
+        if my_nick:
+            st.session_state.saved_me = my_nick
+        opp = analyze(onick, MT, QUICK_N, api_key, "상대 최근 경기 불러오는 중")
+        mine = None
+        if not isinstance(opp, str) and my_nick:
+            mine = analyze(my_nick, MT, 20, api_key, "내 최근 경기 불러오는 중")
+        st.session_state.scout = (onick, opp, mine)
+        st.session_state.pop("scout_full", None)
+
+    if "scout" in st.session_state:  # 버튼 다시 안 눌러도 카드 유지
+        onick_s, opp, mine = st.session_state.scout
+        if isinstance(opp, str):
+            st.error(opp)
+        else:
+            if isinstance(mine, str):
+                st.warning(mine + " 전략 추천 없이 보여줄게요.")
+                mine = None
+            scout_card(opp, mine)
+            if mine:
+                plans, risks, extra = matchup(mine, opp)
+                more = plans[1:] + extra[1:] + risks[1:]
+                if more:
+                    st.markdown("**추가 전략 메모**")
+                    for t in more:
+                        st.markdown(f"- {t}")
+            if st.button(f"{onick_s} 상세 분석 보기 (최근 {n_games}경기)", key="op_full"):
+                st.session_state.scout_full = analyze(onick_s, MT, n_games, api_key)
+            full = st.session_state.get("scout_full")
+            if full is not None:
+                st.error(full) if isinstance(full, str) else render_full(full, "scout")
+
+with tab_me:
+    nick = st.text_input("내 닉네임", key="me_nick",
+                         value=st.session_state.get("saved_me", ""))
+    if st.button("분석하기", key="me_btn", type="primary") and nick:
+        st.session_state.saved_me = nick
+        r = analyze(nick, MT, n_games, api_key)
+        st.error(r) if isinstance(r, str) else render_full(r, "self")
