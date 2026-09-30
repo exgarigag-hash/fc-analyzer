@@ -15,6 +15,9 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+from common import (DEFAULT_COEF, HEADER_TYPE, calibrate, db_connect, detect_flip,
+                    latest_model, save_match, xg_values)
+
 BASE = "https://open.api.nexon.com"
 QUICK_N = 10  # 스카우팅 카드용 경기 수
 st.set_page_config(page_title="FC 전력분석실", page_icon="⚽", layout="wide")
@@ -307,6 +310,12 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
     except ApiError as e:
         return f"경기 목록을 불러오지 못했어요. API 키와 경기 종류를 확인하세요. ({e})"
     details = fetch_details(ids, key, label)
+    db_save(details, ouid)
+    try:
+        division = next((d.get("division") for d in get_maxdiv(ouid, key)
+                         if d.get("matchType") == mtype), None)
+    except ApiError:
+        division = None
     details.sort(key=lambda d: d.get("matchDate", ""), reverse=True)
 
     me_rows, op_rows, me_shots, op_shots, players, ctrls = [], [], [], [], [], []
@@ -343,7 +352,7 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
 
     me_df, bm_df = pd.DataFrame(me_rows), pd.DataFrame(op_rows)
     ctrl = pd.Series(ctrls).mode().iat[0] if ctrls else None
-    return {"nick": nick, "ouid": ouid, "me": me_df, "bm": bm_df,
+    return {"nick": nick, "ouid": ouid, "division": division, "me": me_df, "bm": bm_df,
             "me_shots": me_shots, "op_shots": op_shots, "players": pd.DataFrame(players),
             "cmp": compare(me_df, bm_df), "tags": style_tags(me_df, bm_df),
             "controller": CONTROLLER.get(str(ctrl).lower(), ctrl) if ctrl else None}
@@ -401,6 +410,300 @@ def matchup(mine, opp):
 def fmt(v):
     return "-" if pd.isna(v) else f"{v:.1f}"
 
+
+
+# ================================================================ DB (선택: 없으면 앱만 단독 동작)
+def _secret(name):
+    v = os.environ.get(name, "")
+    try:
+        v = v or st.secrets.get(name, "")
+    except Exception:
+        pass
+    return v
+
+
+@st.cache_resource(show_spinner=False)
+def db():
+    url = _secret("DATABASE_URL")
+    if not url:
+        return None
+    try:
+        return db_connect(url)
+    except Exception:
+        return None
+
+
+def cursor():
+    c = db()
+    if c is None:
+        return None
+    try:
+        cur = c.cursor()
+        cur.execute("select 1")
+        cur.fetchone()
+        return cur
+    except Exception:
+        db.clear()
+        c = db()
+        return c.cursor() if c else None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_model():
+    cur = cursor()
+    if cur is None:
+        return DEFAULT_COEF, None, 0
+    try:
+        return latest_model(cur)
+    except Exception:
+        return DEFAULT_COEF, None, 0
+
+
+def db_save(details, ouid):
+    """조회한 경기를 DB에 쌓고, 검색한 유저를 수집 대기열에 추가."""
+    cur = cursor()
+    if cur is None:
+        return
+    _, flip, _ = load_model()
+    if flip is None:
+        flip = detect_flip([s for d in details for x in d.get("matchInfo") or []
+                            for s in x.get("shootDetail") or []])
+    try:
+        for d in details:
+            save_match(cur, d, flip)
+        cur.execute("insert into crawl_queue(ouid) values (%s) on conflict do nothing", (ouid,))
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def tier_population(mtype, division):
+    """같은 등급 유저들의 경기당 xG/허용xG/결정력/막판방어 분포. 30명 미만이면 등급 범위를 넓힘."""
+    cur = cursor()
+    if cur is None or division is None:
+        return None
+    try:
+        ids = sorted(d["divisionId"] for d in meta("division"))
+        names = {d["divisionId"]: d["divisionName"] for d in meta("division")}
+        if division not in ids:
+            return None
+        cur.execute("select max(id) from patches")
+        pid = cur.fetchone()[0]
+        i = ids.index(division)
+        for span in (0, 1, 2):
+            near = ids[max(0, i - span): i + span + 1]
+            for patch in (pid, None):
+                cur.execute("""
+                  select avg(xg), avg(xga), avg(gf - xg), avg(ga - xga) from side_summary
+                  where match_type = %s and division = any(%s)
+                    and (%s::int is null or patch_id = %s)
+                  group by ouid having count(*) >= 10""", (mtype, near, patch, patch))
+                rows = cur.fetchall()
+                if len(rows) >= 30:
+                    return {"pop": np.array(rows, dtype=float), "n": len(rows),
+                            "divs": [names.get(d, str(d)) for d in near],
+                            "patch_only": patch is not None}
+    except Exception:
+        return None
+    return None
+
+
+# ================================================================ 진단 (xG 분해)
+COMP4 = [("create", "찬스 창출", 1, "경기당 xG · 좋은 슈팅 기회를 얼마나 만드는지"),
+         ("finish", "결정력", 1, "실제 골 − xG · 기대보다 더 넣는지"),
+         ("defend", "수비 조직", -1, "경기당 허용 xG · 위험한 찬스를 얼마나 내주는지"),
+         ("keeper", "막판 방어", -1, "실제 실점 − 허용 xG · 골키퍼·블록, 그리고 운")]
+COMP3 = [("balance", "찬스 싸움", 1, "경기당 (xG − 허용 xG) · 상대보다 좋은 찬스를 많이 만드는지"),
+         COMP4[1], COMP4[3]]
+POP_COL = {"create": 0, "defend": 1, "finish": 2, "keeper": 3}
+TYPE_NAME = {"create": "찬스 부족형", "finish": "마무리 부족형", "defend": "수비 조직 불안형",
+             "keeper": "막판 방어 불안형", "balance": "찬스 싸움 열세형"}
+CONCL_SELF = {
+    "create": "마무리보다 슈팅 기회 자체가 부족한 게 핵심이에요. 박스 안으로 들어가는 횟수를 늘리는 게 우선이에요.",
+    "finish": "찬스는 만드는데 기대만큼 못 넣고 있어요. 슈팅 위치와 종류 선택을 점검하세요. 다만 결정력은 운의 영향도 커요.",
+    "defend": "상대에게 좋은 찬스를 너무 많이 내주고 있어요. 박스 앞 공간과 수비 라인 간격부터 점검하세요.",
+    "keeper": "허용한 찬스에 비해 실점이 많아요. 블록이나 골키퍼 문제일 수도 있지만 운의 영향이 가장 큰 항목이에요.",
+    "balance": "상대보다 좋은 찬스를 덜 만들거나 더 많이 내주고 있어요. 공격과 수비 중 어디서 밀리는지는 비교 데이터가 쌓이면 나눠서 볼 수 있어요.",
+}
+CONCL_SCOUT = {
+    "create": "찬스를 잘 못 만드는 상대예요. 라인을 올려 압박해도 위험이 적어요.",
+    "finish": "마무리가 약한 상대예요. 슈팅은 좀 내줘도 박스 안 결정적 찬스만 막으세요.",
+    "defend": "좋은 찬스를 많이 내주는 상대예요. 박스 안 침투를 적극적으로 노리세요.",
+    "keeper": "허용 찬스 대비 실점이 많은 상대예요. 유효슈팅을 최대한 많이 만드세요.",
+    "balance": "찬스 싸움에서 자주 밀리는 상대예요. 주도권을 잡고 운영하세요.",
+}
+SURE = ("확실한 강점", "확실한 약점")
+
+
+def per_match_xg(r, coef, flip):
+    n = len(r["me"])
+    xf, xa = np.zeros(n), np.zeros(n)
+    for s, p in zip(r["me_shots"], xg_values(r["me_shots"], coef, flip)):
+        xf[s["_m"]] += p
+    for s, p in zip(r["op_shots"], xg_values(r["op_shots"], coef, flip)):
+        xa[s["_m"]] += p
+    return xf, xa
+
+
+def diagnose(r, coef, flip, tier):
+    me = r["me"]
+    n = len(me)
+    xf, xa = per_match_xg(r, coef, flip)
+    gf, ga = me.gf.values.astype(float), me.ga.values.astype(float)
+    arr = {"create": xf, "finish": gf - xf, "defend": xa, "keeper": ga - xa, "balance": xf - xa}
+    if tier:
+        pop = tier["pop"]
+        comps = COMP4
+        bench = {k: pop[:, c].mean() for k, c in POP_COL.items()}
+    else:
+        comps = COMP3
+        bench = {"balance": 0.0, "finish": 0.0, "keeper": 0.0}
+    idx = np.random.default_rng(0).integers(0, n, (2000, n))  # 부트스트랩: 경기 재추출
+    out = []
+    for key, name, sign, desc in comps:
+        a, b = arr[key], bench[key]
+        boot = sign * (a[idx].mean(1) - b)
+        est = sign * (a.mean() - b)
+        lo95, hi95 = np.percentile(boot, [2.5, 97.5])
+        lo80, hi80 = np.percentile(boot, [10, 90])
+        if lo95 > 0:
+            verdict = "확실한 강점"
+        elif hi95 < 0:
+            verdict = "확실한 약점"
+        elif lo80 > 0:
+            verdict = "강점 가능성"
+        elif hi80 < 0:
+            verdict = "약점 가능성"
+        else:
+            verdict = "판단 보류"
+        need = None
+        se = boot.std()
+        if verdict not in SURE and abs(est) > 0.03 and se > 0:
+            need = int(min(500, max(5, np.ceil(n * (1.96 * se / abs(est)) ** 2 - n))))
+        pct = None
+        if tier:
+            vals = tier["pop"][:, POP_COL[key]]
+            better = (vals > a.mean()).mean() if sign > 0 else (vals < a.mean()).mean()
+            pct = max(1, int(round(100 * better)))
+        out.append({"key": key, "name": name, "desc": desc, "value": a.mean(), "bench": b,
+                    "impact": est, "verdict": verdict, "need": need, "pct": pct})
+    return out, xf, xa
+
+
+def _resid(shots, xs, mask, n):
+    m = np.array([mask(s) for s in shots], dtype=bool)
+    if not m.any():
+        return np.nan
+    g = np.array([s.get("result") == 3 for s in shots])[m].sum()
+    return (g - xs[m].sum()) / n
+
+
+def drill(r, key, coef, flip):
+    """가장 큰 약점을 세부 지표로 쪼개서 보여줌 (이번 경기 상대들과 비교)."""
+    me, bm, n = r["me"], r["bm"], len(r["me"])
+    ms, os_ = r["me_shots"], r["op_shots"]
+    xm, xo = xg_values(ms, coef, flip), xg_values(os_, coef, flip)
+    avg = lambda x: x.mean() if len(x) else np.nan
+    rows = []
+    if key in ("create", "balance"):
+        rows += [("경기당 슈팅", me.shots.mean(), bm.shots.mean()),
+                 ("슈팅 1개당 xG (슈팅 질)", avg(xm), avg(xo)),
+                 ("박스 안 슈팅 비중(%)", me.box_share.mean(), bm.box_share.mean())]
+    if key in ("defend", "balance"):
+        rows += [("경기당 허용 슈팅", me.shots_against.mean(), bm.shots_against.mean()),
+                 ("허용 슈팅 1개당 xG", avg(xo), avg(xm)),
+                 ("허용 유효슈팅", me.sot_against.mean(), bm.sot_against.mean())]
+    if key == "finish":
+        rows += [("박스 안 골 − xG (경기당)", _resid(ms, xm, lambda s: s.get("inPenalty"), n),
+                  _resid(os_, xo, lambda s: s.get("inPenalty"), n)),
+                 ("박스 밖 골 − xG (경기당)", _resid(ms, xm, lambda s: not s.get("inPenalty"), n),
+                  _resid(os_, xo, lambda s: not s.get("inPenalty"), n)),
+                 ("헤딩 골 − xG (경기당)", _resid(ms, xm, lambda s: s.get("type") == HEADER_TYPE, n),
+                  _resid(os_, xo, lambda s: s.get("type") == HEADER_TYPE, n)),
+                 ("유효슈팅 비율(%)", me.sot_rate.mean(), bm.sot_rate.mean())]
+    if key == "keeper":
+        conc = lambda g, s: g.sum() / s.sum() * 100 if s.sum() else np.nan
+        rows += [("허용 유효슈팅 대비 실점(%)", conc(me.ga, me.sot_against), conc(bm.ga, bm.sot_against)),
+                 ("블록 성공률(%)", me.block_rate.mean(), bm.block_rate.mean())]
+    return pd.DataFrame(rows, columns=["세부 지표", "대상", "이번 경기 상대들"]).round(2)
+
+
+DIAG_CSS = """
+<style>
+.dg-card{border:2px solid #3b7dd8;border-radius:14px;padding:18px 22px;margin:6px 0 12px}
+.dg-type{font-size:1.8rem;font-weight:800;margin-bottom:10px}
+.dg-row{font-size:1.1rem;line-height:1.5;margin:4px 0}
+.dg-k{display:inline-block;min-width:5.5em;font-weight:700;opacity:.8}
+.dg-concl{font-size:1.1rem;margin-top:12px;padding-top:10px;border-top:1px solid rgba(128,128,128,.3)}
+</style>
+"""
+
+
+def render_diagnosis(r, mode):
+    coef, flip, n_model = load_model()
+    shots_all = r["me_shots"] + r["op_shots"]
+    if flip is None:
+        flip = detect_flip(shots_all)
+    if not n_model:
+        coef = calibrate(DEFAULT_COEF, shots_all, flip)
+    tier = tier_population(st.session_state.mtype, r.get("division"))
+    res, xf, xa = diagnose(r, coef, flip, tier)
+
+    weak = [x for x in res if x["verdict"] in ("확실한 약점", "약점 가능성")]
+    strong = [x for x in res if x["verdict"] in ("확실한 강점", "강점 가능성")]
+    hold = [x for x in res if x["verdict"] == "판단 보류"]
+    primary = min(weak, key=lambda x: x["impact"]) if weak else None
+    title = TYPE_NAME[primary["key"]] if primary else "뚜렷한 약점 없음"
+
+    def tag(x):
+        t = x["name"] + (" (확실)" if x["verdict"] in SURE else " (가능성)")
+        return t + (f" · 상위 {x['pct']}%" if x["pct"] else "")
+
+    rows = [f'<div class="dg-row"><span class="dg-k">특화</span>'
+            f'{", ".join(tag(x) for x in sorted(strong, key=lambda x: -x["impact"])) or "없음"}</div>',
+            f'<div class="dg-row"><span class="dg-k">못하는 것</span>'
+            f'{", ".join(tag(x) for x in sorted(weak, key=lambda x: x["impact"])) or "없음"}</div>']
+    if hold:
+        rows.append('<div class="dg-row"><span class="dg-k">판단 보류</span>' + ", ".join(
+            x["name"] + (f" ({x['need']}경기 더 필요)" if x["need"] else " (기준과 차이 없음)")
+            for x in hold) + "</div>")
+    concl = ""
+    if primary:
+        concl = (CONCL_SELF if mode == "self" else CONCL_SCOUT)[primary["key"]]
+    elif hold and not strong:
+        concl = "아직은 기준과 뚜렷하게 다른 부분이 없어요. 경기 수를 늘리면 판단이 선명해져요."
+    head = "진단" if mode == "self" else "상대 유형"
+    st.markdown(DIAG_CSS + f'<div class="dg-card"><div class="dg-row" style="opacity:.7">{head}</div>'
+                f'<div class="dg-type">{title}</div>' + "".join(rows)
+                + (f'<div class="dg-concl">{concl}</div>' if concl else "") + "</div>",
+                unsafe_allow_html=True)
+
+    parts = " / ".join(f"{x['name']} {x['impact']:+.2f}" for x in res)
+    st.caption(f"기준 대비 경기당 득실 영향(골): {parts}  (+ 는 유리, − 는 불리)")
+
+    tbl = pd.DataFrame([{"항목": x["name"], "설명": x["desc"], "대상": round(x["value"], 2),
+                         "기준": round(x["bench"], 2), "영향(골/경기)": round(x["impact"], 2),
+                         "판정": x["verdict"],
+                         **({"등급 내 위치": f"상위 {x['pct']}%"} if tier else {}),
+                         "확정까지": f"{x['need']}경기 더" if x["need"] else "-"} for x in res])
+    st.dataframe(tbl, hide_index=True, width="stretch")
+
+    if tier:
+        st.caption(f"비교 기준: {', '.join(tier['divs'])} 유저 {tier['n']}명 "
+                   f"({'현재 패치' if tier['patch_only'] else '최근 28일 전체'}, 유저당 10경기 이상)")
+    else:
+        st.caption("같은 등급 유저 데이터가 아직 부족해서, 찬스 창출과 수비 조직을 합친 '찬스 싸움'으로 봤어요. "
+                   "데이터베이스에 유저가 쌓이면 둘을 나눠서 등급 내 위치까지 보여줘요.")
+    st.caption(f"xG 모델: {'수집한 슈팅 ' + format(n_model, ',') + '개로 학습' if n_model else '기본 모델을 이번 경기 슈팅에 맞춰 보정한 임시 모델'}. "
+               "판정은 경기를 2000번 재추출한 부트스트랩 결과예요 (확실 95%, 가능성 80%).")
+
+    if primary:
+        st.markdown(f"**{primary['name']} 세부 분석**")
+        st.dataframe(drill(r, primary["key"], coef, flip), hide_index=True, width="stretch")
+    with st.expander("xG가 뭐야?"):
+        st.write("xG(기대 득점)는 슈팅 위치, 골대까지 거리와 각도, 헤딩 여부로 '이 슈팅이 골이 될 확률'을 계산한 값이에요. "
+                 "예를 들어 xG 0.3짜리 슈팅은 10번 중 3번쯤 들어가는 기회예요. "
+                 "경기당 xG는 찬스를 얼마나 만들었는지, '실제 골 − xG'는 기대보다 더 넣었는지를 보여줘요.")
 
 # ================================================================ 시각화
 CARD_CSS = """
@@ -540,14 +843,14 @@ def render_full(r, mode):
     c2.metric("전적", f"{w}승 {dr}무 {l}패")
     c3.metric("평균 스코어", f"{me.gf.mean():.1f} : {me.ga.mean():.1f}")
     c4.metric("역대 최고 등급", best_txt)
-    st.caption("비교 기준은 같은 경기에서 만난 상대들의 평균이에요. "
-               "매칭은 실력대가 비슷한 상대끼리 잡히므로, 같은 구간 유저 평균에 가까운 기준입니다.")
 
+    render_diagnosis(r, mode)
+    st.subheader("세부 지표 (이번 경기 상대 대비)")
     strong = cmp_df[cmp_df.효과 >= 0.3].sort_values("효과", ascending=False)
     weak = cmp_df[cmp_df.효과 <= -0.3].sort_values("효과")
     left, right = st.columns([1.1, 1])
     with left:
-        st.plotly_chart(radar(cmp_df, nick), use_container_width=True)
+        st.plotly_chart(radar(cmp_df, nick), width="stretch")
     with right:
         st.subheader("플레이 스타일")
         st.write(" / ".join(r["tags"]) + (f" / {r['controller']}" if r["controller"] else ""))
@@ -576,37 +879,39 @@ def render_full(r, mode):
     st.bar_chart(tdf, color=["#1f8a5b", "#d0463b"])
 
     s1, s2 = st.columns(2)
-    s1.plotly_chart(shot_map(r["me_shots"], "슈팅 위치"), use_container_width=True)
-    s2.plotly_chart(shot_map(r["op_shots"], "허용한 슈팅 위치"), use_container_width=True)
+    s1.plotly_chart(shot_map(r["me_shots"], "슈팅 위치"), width="stretch")
+    s2.plotly_chart(shot_map(r["op_shots"], "허용한 슈팅 위치"), width="stretch")
 
     with st.expander("전체 지표 비교표"):
         show = cmp_df[["지표", "대상", "비교 평균", "차이", "효과"]].copy()
         show.columns = ["지표", nick, "비교 평균", "차이", "효과크기 (+ 좋음)"]
-        st.dataframe(show.round(2), hide_index=True, use_container_width=True)
+        st.dataframe(show.round(2), hide_index=True, width="stretch")
         sty = pd.DataFrame({"지표": [LABEL[k] for k, _ in STYLE],
                             nick: [me[k].mean() for k, _ in STYLE],
                             "비교 평균": [bm[k].mean() for k, _ in STYLE]}).round(1)
-        st.dataframe(sty, hide_index=True, use_container_width=True)
+        st.dataframe(sty, hide_index=True, width="stretch")
     with st.expander("선수별 기록"):
-        st.dataframe(player_table(r["players"]), use_container_width=True)
+        st.dataframe(player_table(r["players"]), width="stretch")
     with st.expander("최근 경기"):
         st.dataframe(me[["date", "opp", "score", "result"]]
                      .rename(columns={"date": "일시", "opp": "상대", "score": "스코어",
                                       "result": "결과"}),
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
 
 
 # ================================================================ 화면
 st.title("FC 전력분석실")
 
 with st.sidebar:
-    default_key = os.environ.get("NEXON_API_KEY", "")
-    try:
-        default_key = default_key or st.secrets.get("NEXON_API_KEY", "")
-    except Exception:
-        pass
-    api_key = st.text_input("넥슨 Open API 키", value=default_key, type="password",
-                            help="openapi.nexon.com 에서 FC온라인 애플리케이션을 등록하면 발급돼요.")
+    server_key = _secret("NEXON_API_KEY")
+    if server_key:  # 운영자 키가 있으면 방문자는 아무것도 입력 안 해도 됨 (키는 화면에 절대 노출 안 함)
+        with st.expander("내 API 키로 쓰기 (선택)"):
+            own_key = st.text_input("넥슨 Open API 키", type="password", key="own_key",
+                                    help="많이 쓰는 경우에만 넣으세요. 비워두면 기본 키를 써요.")
+        api_key = own_key or server_key
+    else:
+        api_key = st.text_input("넥슨 Open API 키", type="password",
+                                help="openapi.nexon.com 에서 FC온라인 애플리케이션을 등록하면 발급돼요.")
     try:
         mtypes = {m["desc"]: m["matchtype"] for m in meta("matchtype")}
     except Exception:
@@ -631,7 +936,7 @@ with tab_scout:
                           placeholder="로딩 화면에 뜬 상대 닉네임")
     my_nick = c2.text_input("내 닉네임 (전략 추천용)", key="my_nick_scout",
                             value=st.session_state.get("saved_me", ""))
-    if st.button("스카우팅", key="op_btn", type="primary", use_container_width=True) and onick:
+    if st.button("스카우팅", key="op_btn", type="primary", width="stretch") and onick:
         if my_nick:
             st.session_state.saved_me = my_nick
         opp = analyze(onick, MT, QUICK_N, api_key, "상대 최근 경기 불러오는 중")
@@ -670,3 +975,6 @@ with tab_me:
         st.session_state.saved_me = nick
         r = analyze(nick, MT, n_games, api_key)
         st.error(r) if isinstance(r, str) else render_full(r, "self")
+
+st.divider()
+st.caption("Data based on NEXON Open API")
