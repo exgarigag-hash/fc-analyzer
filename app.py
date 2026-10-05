@@ -6,6 +6,7 @@ FC 온라인 전력분석실
 실행: streamlit run app.py
 """
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -312,10 +313,14 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
     details = fetch_details(ids, key, label)
     db_save(details, ouid)
     try:
-        division = next((d.get("division") for d in get_maxdiv(ouid, key)
-                         if d.get("matchType") == mtype), None)
+        best = next((d for d in get_maxdiv(ouid, key) if d.get("matchType") == mtype), {})
     except ApiError:
-        division = None
+        best = {}
+    max_div, max_date = best.get("division"), (best.get("achievementDate") or "")[:10]
+    opp_ouids = tuple(sorted({x.get("ouid") for d in details for x in d.get("matchInfo") or []
+                              if x.get("ouid") != ouid}))
+    est_div, n_opp = estimate_tier(opp_ouids)
+    division = est_div or max_div
     details.sort(key=lambda d: d.get("matchDate", ""), reverse=True)
 
     me_rows, op_rows, me_shots, op_shots, players, ctrls = [], [], [], [], [], []
@@ -352,7 +357,8 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
 
     me_df, bm_df = pd.DataFrame(me_rows), pd.DataFrame(op_rows)
     ctrl = pd.Series(ctrls).mode().iat[0] if ctrls else None
-    return {"nick": nick, "ouid": ouid, "division": division, "me": me_df, "bm": bm_df,
+    return {"nick": nick, "ouid": ouid, "division": division, "max_div": max_div,
+            "max_date": max_date, "est_div": est_div, "n_opp": n_opp, "me": me_df, "bm": bm_df,
             "me_shots": me_shots, "op_shots": op_shots, "players": pd.DataFrame(players),
             "cmp": compare(me_df, bm_df), "tags": style_tags(me_df, bm_df),
             "controller": CONTROLLER.get(str(ctrl).lower(), ctrl) if ctrl else None}
@@ -428,7 +434,9 @@ def db():
     if not url:
         return None
     try:
-        return db_connect(url)
+        c = db_connect(url)
+        c.execute("set statement_timeout = '6s'")  # 느린 쿼리가 화면을 붙잡지 않게
+        return c
     except Exception:
         return None
 
@@ -459,21 +467,38 @@ def load_model():
         return DEFAULT_COEF, None, 0
 
 
+@st.cache_resource
+def saved_ids():
+    return set()  # 이미 DB에 저장한 경기 (중복 저장 방지)
+
+
 def db_save(details, ouid):
-    """조회한 경기를 DB에 쌓고, 검색한 유저를 수집 대기열에 추가."""
-    cur = cursor()
-    if cur is None:
+    """조회한 경기를 DB에 쌓는 작업을 뒤에서 따로 돌림 → 분석 화면을 기다리게 하지 않음."""
+    url = _secret("DATABASE_URL")
+    if not url:
+        return
+    done = saved_ids()
+    todo = [d for d in details if d.get("matchId") not in done]
+    if not todo:
         return
     _, flip, _ = load_model()
     if flip is None:
         flip = detect_flip([s for d in details for x in d.get("matchInfo") or []
                             for s in x.get("shootDetail") or []])
-    try:
-        for d in details:
-            save_match(cur, d, flip)
-        cur.execute("insert into crawl_queue(ouid) values (%s) on conflict do nothing", (ouid,))
-    except Exception:
-        pass
+
+    def work():
+        try:
+            conn = db_connect(url)
+            cur = conn.cursor()
+            for d in todo:
+                save_match(cur, d, flip)
+                done.add(d.get("matchId"))
+            cur.execute("insert into crawl_queue(ouid) values (%s) on conflict do nothing", (ouid,))
+            conn.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -506,6 +531,35 @@ def tier_population(mtype, division):
     except Exception:
         return None
     return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def estimate_tier(opp_ouids):
+    """추정 현재 등급 = 최근 상대들의 등급 중앙값 (매칭은 비슷한 실력끼리 잡히니까)."""
+    cur = cursor()
+    if cur is None or not opp_ouids:
+        return None, 0
+    try:
+        cur.execute("select percentile_disc(0.5) within group (order by max_division), count(*) "
+                    "from users where ouid = any(%s) and max_division is not null", (list(opp_ouids),))
+        v, n = cur.fetchone()
+        return (v, n) if n >= 5 else (None, n)
+    except Exception:
+        return None, 0
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def tier_table(mtype):
+    cur = cursor()
+    if cur is None:
+        return None
+    try:
+        cur.execute("select * from tier_metrics where match_type = %s and users >= 10", (mtype,))
+        cols = [c.name for c in cur.description]
+        df = pd.DataFrame(cur.fetchall(), columns=cols)
+        return df if len(df) else None
+    except Exception:
+        return None
 
 
 # ================================================================ 진단 (xG 분해)
@@ -626,6 +680,81 @@ def drill(r, key, coef, flip):
         rows += [("허용 유효슈팅 대비 실점(%)", conc(me.ga, me.sot_against), conc(bm.ga, bm.sot_against)),
                  ("블록 성공률(%)", me.block_rate.mean(), bm.block_rate.mean())]
     return pd.DataFrame(rows, columns=["세부 지표", "대상", "이번 경기 상대들"]).round(2)
+
+
+TIER_METRICS = [  # (키, 이름, 높을수록 좋은가)
+    ("xg", "찬스 창출 (경기당 xG)", True), ("xga", "허용 찬스 (경기당 허용 xG)", False),
+    ("gf", "경기당 득점", True), ("ga", "경기당 실점", False), ("win_rate", "승률(%)", True),
+    ("shots", "경기당 슈팅", True), ("sot_rate", "유효슈팅 비율(%)", True),
+    ("box_share", "박스 안 슈팅 비중(%)", None), ("pass_rate", "패스 성공률(%)", True),
+    ("through_rate", "스루패스 성공률(%)", True), ("tackle_rate", "태클 성공률(%)", True),
+    ("block_rate", "블록 성공률(%)", True), ("possession", "점유율(%)", None),
+]
+
+
+def div_names():
+    try:
+        return {d["divisionId"]: d["divisionName"] for d in meta("division")}
+    except Exception:
+        return {}
+
+
+def render_tier(r):
+    st.subheader("등급별 비교")
+    names = div_names()
+    est, mx = r.get("est_div"), r.get("max_div")
+    line = []
+    if est:
+        line.append(f"추정 현재 등급 **{names.get(est, est)}** (최근 상대 {r['n_opp']}명의 등급 기준)")
+    if mx:
+        line.append(f"역대 최고 등급 **{names.get(mx, mx)}**" + (f" ({r['max_date']} 달성)" if r.get("max_date") else ""))
+    if line:
+        st.markdown(" · ".join(line))
+    tt = tier_table(st.session_state.mtype)
+    if tt is None:
+        st.caption("등급별 평균을 만들 데이터가 아직 부족해요. 수집기가 등급마다 유저 10명 이상을 모으면 나타나요.")
+        return
+    tt = tt.sort_values("division")  # 등급 번호가 작을수록 높은 등급
+    coef, flip, n_model = load_model()
+    shots_all = r["me_shots"] + r["op_shots"]
+    if flip is None:
+        flip = detect_flip(shots_all)
+    if not n_model:
+        coef = calibrate(DEFAULT_COEF, shots_all, flip)
+    xf, xa = per_match_xg(r, coef, flip)
+    me = r["me"]
+    mine = {"xg": xf.mean(), "xga": xa.mean(), "gf": me.gf.mean(), "ga": me.ga.mean(),
+            "win_rate": me.win.mean(), "shots": me.shots.mean(), "sot_rate": me.sot_rate.mean(),
+            "box_share": me.box_share.mean(), "pass_rate": me.pass_rate.mean(),
+            "through_rate": me.through_rate.mean(), "tackle_rate": me.tackle_rate.mean(),
+            "block_rate": me.block_rate.mean(), "possession": me.poss.mean()}
+    my_row = tt[tt.division == r.get("division")]
+    rows = []
+    for k, label, hb in TIER_METRICS:
+        v = mine.get(k)
+        col = tt[k].astype(float)
+        if pd.isna(v) or col.isna().all():
+            continue
+        nm = lambda idx: names.get(tt.loc[idx, "division"], tt.loc[idx, "division"])
+        hi, lo = col.idxmax(), col.idxmin()
+        if v > col.max():    # 모든 등급 평균보다 높음
+            lv = f"{nm(hi)} 이상" if hb is True else f"{nm(hi)} 미만" if hb is False else "모든 등급보다 높음"
+        elif v < col.min():  # 모든 등급 평균보다 낮음
+            lv = f"{nm(lo)} 미만" if hb is True else f"{nm(lo)} 이상" if hb is False else "모든 등급보다 낮음"
+        else:
+            lv = nm((col - v).abs().idxmin())  # 평균이 가장 비슷한 등급
+        rows.append({"지표": label, "나": round(v, 2),
+                     "내 등급 평균": round(float(my_row[k].iloc[0]), 2) if len(my_row) else None,
+                     "이 수치에 해당하는 등급": lv if hb is not None else f"{lv} (스타일 지표, 좋고 나쁨 없음)"})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption("'이 수치에 해당하는 등급'은 그 지표만 놓고 봤을 때 평균이 가장 비슷한 등급이에요. "
+               "예를 들어 찬스 창출이 두 등급 위 수준이면 공격 전개는 이미 상위권이라는 뜻이에요.")
+    with st.expander("등급별 평균 지표 전체 보기"):
+        show = tt.copy()
+        show.insert(0, "등급", show.division.map(lambda d: names.get(d, d)))
+        show = show.drop(columns=["match_type", "division"]).rename(columns={
+            "users": "유저 수", "sides": "경기 수", **{k: l for k, l, _ in TIER_METRICS}})
+        st.dataframe(show.round(2), hide_index=True, width="stretch")
 
 
 DIAG_CSS = """
@@ -829,22 +958,19 @@ def render_loss(r, mode):
 def render_full(r, mode):
     me, bm, cmp_df = r["me"], r["bm"], r["cmp"]
     nick = r["nick"]
-    try:
-        divs = {d["divisionId"]: d["divisionName"] for d in meta("division")}
-        best = next((d for d in get_maxdiv(r["ouid"], st.session_state.api_key)
-                     if d.get("matchType") == st.session_state.mtype), None)
-        best_txt = divs.get(best["division"], "-") if best else "-"
-    except Exception:
-        best_txt = "-"
+    names = div_names()
+    best_txt = names.get(r.get("est_div") or r.get("max_div"), "-")
+    best_label = "추정 현재 등급" if r.get("est_div") else "역대 최고 등급"
     w, dr = (me.result == "승").sum(), (me.result == "무").sum()
     l = len(me) - w - dr
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("분석 경기", f"{len(me)}경기")
     c2.metric("전적", f"{w}승 {dr}무 {l}패")
     c3.metric("평균 스코어", f"{me.gf.mean():.1f} : {me.ga.mean():.1f}")
-    c4.metric("역대 최고 등급", best_txt)
+    c4.metric(best_label, best_txt)
 
     render_diagnosis(r, mode)
+    render_tier(r)
     st.subheader("세부 지표 (이번 경기 상대 대비)")
     strong = cmp_df[cmp_df.효과 >= 0.3].sort_values("효과", ascending=False)
     weak = cmp_df[cmp_df.효과 <= -0.3].sort_values("효과")
@@ -891,7 +1017,9 @@ def render_full(r, mode):
                             "비교 평균": [bm[k].mean() for k, _ in STYLE]}).round(1)
         st.dataframe(sty, hide_index=True, width="stretch")
     with st.expander("선수별 기록"):
-        st.dataframe(player_table(r["players"]), width="stretch")
+        if st.toggle("불러오기 (처음 한 번은 선수 이름 데이터를 받느라 몇 초 걸려요)",
+                     key=f"pt_{mode}_{r['nick']}"):
+            st.dataframe(player_table(r["players"]), width="stretch")
     with st.expander("최근 경기"):
         st.dataframe(me[["date", "opp", "score", "result"]]
                      .rename(columns={"date": "일시", "opp": "상대", "score": "스코어",
@@ -928,6 +1056,22 @@ st.session_state.api_key = api_key
 st.session_state.mtype = mtypes[mname]
 MT = mtypes[mname]
 
+def run_with_status(nick, n, title):
+    """단계별 진행 상황을 보여주면서 분석 + 무거운 계산을 미리 끝냄."""
+    with st.status(f"{title}: 1/3 경기 기록 불러오는 중", expanded=True) as stt:
+        st.caption(f"처음 조회하는 경기는 {n}경기 기준 20초~1분 걸려요. 한 번 불러온 경기는 다음부터 바로 떠요.")
+        r = analyze(nick, MT, n, api_key)
+        if isinstance(r, str):
+            stt.update(label=f"{title}: 실패", state="error", expanded=False)
+            return r
+        stt.update(label=f"{title}: 2/3 등급 비교 데이터 확인 중")
+        load_model()
+        tier_population(MT, r.get("division"))
+        stt.update(label=f"{title}: 3/3 화면 그리는 중")
+        stt.update(label=f"{title}: 완료 ({len(r['me'])}경기)", state="complete", expanded=False)
+    return r
+
+
 tab_scout, tab_me = st.tabs(["상대 스카우팅", "내 분석"])
 
 with tab_scout:
@@ -963,7 +1107,7 @@ with tab_scout:
                     for t in more:
                         st.markdown(f"- {t}")
             if st.button(f"{onick_s} 상세 분석 보기 (최근 {n_games}경기)", key="op_full"):
-                st.session_state.scout_full = analyze(onick_s, MT, n_games, api_key)
+                st.session_state.scout_full = run_with_status(onick_s, n_games, "상세 분석")
             full = st.session_state.get("scout_full")
             if full is not None:
                 st.error(full) if isinstance(full, str) else render_full(full, "scout")
@@ -973,8 +1117,10 @@ with tab_me:
                          value=st.session_state.get("saved_me", ""))
     if st.button("분석하기", key="me_btn", type="primary") and nick:
         st.session_state.saved_me = nick
-        r = analyze(nick, MT, n_games, api_key)
-        st.error(r) if isinstance(r, str) else render_full(r, "self")
+        st.session_state.me_result = run_with_status(nick, n_games, "내 분석")
+    res = st.session_state.get("me_result")  # 다른 버튼을 눌러도 결과 유지
+    if res is not None:
+        st.error(res) if isinstance(res, str) else render_full(res, "self")
 
 st.divider()
 st.caption("Data based on NEXON Open API")
