@@ -425,7 +425,7 @@ def _secret(name):
         v = v or st.secrets.get(name, "")
     except Exception:
         pass
-    return v
+    return (v or "").strip()
 
 
 @st.cache_resource(show_spinner=False)

@@ -23,7 +23,8 @@ class Nexon:
     """호출 간격과 호출 예산(수집기용)을 지키는 API 클라이언트."""
 
     def __init__(self, key, interval=0.0, max_calls=None):
-        self.key, self.interval, self.max_calls = key, interval, max_calls
+        self.key = (key or "").strip()  # 복사할 때 딸려 온 줄바꿈·공백 제거
+        self.interval, self.max_calls = interval, max_calls
         self.calls, self._last = 0, 0.0
 
     def get(self, path, params):
@@ -171,7 +172,7 @@ def fit_logit(X, y, l2=1.0, iters=30):
 # ================================================================ DB (Supabase Postgres)
 def db_connect(url):
     import psycopg
-    return psycopg.connect(url, autocommit=True, prepare_threshold=None, connect_timeout=8)
+    return psycopg.connect(url.strip().strip("\"'"), autocommit=True, prepare_threshold=None, connect_timeout=8)
 
 
 SIDE_COLS = ["ouid", "nickname", "result", "gf", "ga", "shots", "sot", "shots_box",
