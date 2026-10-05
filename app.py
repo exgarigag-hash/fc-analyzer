@@ -5,6 +5,7 @@ FC 온라인 전력분석실
 데이터: 넥슨 Open API (https://openapi.nexon.com)
 실행: streamlit run app.py
 """
+import json
 import os
 import threading
 import time
@@ -383,8 +384,9 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
             stt = p.get("status") or {}
             if p.get("spPosition") == 28 or not stt.get("spRating"):
                 continue
-            players.append({"spId": p.get("spId"), "pos": p.get("spPosition"),
-                            **{k: stt.get(k, 0) for k in PLAYER_KEYS}})
+            players.append({"spId": p.get("spId"), "pos": p.get("spPosition"), "m": idx,
+                            "grade": p.get("spGrade"),
+                            **{k: (stt.get(k) or 0) for k in PLAYER_KEYS}})
     if len(me_rows) < 3:
         return f"'{nick}'의 분석 가능한 경기가 3경기 미만이에요. 경기 종류를 바꾸거나 경기 수를 늘려 보세요."
 
@@ -1315,6 +1317,145 @@ def render_deep(r, mode="self"):
                    "경기 수를 늘려도 계속 나오는 패턴을 믿으세요.")
 
 
+
+# ================================================================ 선수·팀 화면 (랭커 비교 / 팀 변경 비교)
+@st.cache_data(ttl=43200, show_spinner=False)
+def ranker_stats(mtype, players, key):
+    """TOP 1만 랭커들이 같은 선수(카드+포지션)를 썼을 때의 평균 기록 (넥슨 ranker-stats)."""
+    out, limited = {}, False
+    for i in range(0, len(players), 10):
+        chunk = [{"id": int(sp), "po": int(po)} for sp, po in players[i:i + 10]]
+        try:
+            res = _get("/fconline/v1/ranker-stats",
+                       {"matchtype": mtype, "players": json.dumps(chunk)}, key)
+        except ApiError as e:
+            if e.status == 429:
+                limited = True
+                break
+            continue
+        for row in res or []:
+            out[(int(row.get("spId", 0)), int(row.get("spPosition", -1)))] = deep.ranker_row(row.get("status"))
+    return out, limited
+
+
+def sp_names():
+    try:
+        return {x["id"]: x["name"] for x in meta("spid")}
+    except Exception:
+        return {}
+
+
+def pos_names():
+    try:
+        return {x["spposition"]: x["desc"] for x in meta("spposition")}
+    except Exception:
+        return {}
+
+
+def render_players_team(r, key):
+    names, pnames = sp_names(), pos_names()
+    pl = r["players"]
+    label = lambda sp, pos=None: f"{names.get(int(sp), str(sp))}" + (f" ({pnames.get(int(pos), pos)})" if pos is not None else "")
+    st.caption(f"{r['nick']} · 최근 {len(r['me'])}경기 기준")
+    if pl is None or pl.empty:
+        st.warning("선수 기록이 있는 경기가 없어요. 넥슨 API 한도가 초기화된 뒤 다시 분석하면 선수 기록이 같이 불러와져요.")
+        return
+
+    # ---- 랭커 비교
+    st.subheader("① 랭커 비교: 같은 선수를 랭커보다 잘 쓰고 있을까?")
+    mine = deep.player_per_game(pl, min_games=5)
+    if mine.empty:
+        st.write("5경기 이상 뛴 선수가 없어요. 분석 경기 수를 늘려 보세요.")
+    else:
+        keys = tuple((int(sp), int(row.pos)) for sp, row in mine.iterrows())
+        rk, limited = ranker_stats(st.session_state.mtype, keys, key)
+        if limited:
+            st.info("오늘 넥슨 API 한도를 다 써서 랭커 기록을 일부만 불러왔어요. 한도가 초기화되면 전부 보여줘요.")
+        cmp_df = deep.ranker_compare(mine, rk)
+        if cmp_df.empty:
+            st.write("랭커 기록이 있는 선수가 없어요. 랭커들이 잘 쓰지 않는 카드이거나, 아직 랭커 기록을 못 불러온 거예요.")
+        else:
+            bad = cmp_df[cmp_df.verdict == "못 살리는 중"]
+            good = cmp_df[cmp_df.verdict == "랭커보다 잘 씀"]
+            if len(bad):
+                st.markdown("**🔻 랭커만큼 못 살리고 있는 선수**")
+                for x in bad.itertuples():
+                    st.markdown(f"- **{label(x.spId, x.pos)}** · 랭커 대비 {x.index:.0f}% · {x.detail}")
+            if len(good):
+                st.markdown("**🔺 랭커보다 잘 쓰고 있는 선수**")
+                for x in good.sort_values("index", ascending=False).itertuples():
+                    st.markdown(f"- **{label(x.spId, x.pos)}** · 랭커 대비 {x.index:.0f}% · {x.detail}")
+            if not len(bad) and not len(good):
+                st.markdown("- 모든 선수가 랭커와 비슷한 수준으로 쓰이고 있어요.")
+            tbl = cmp_df.assign(선수=[label(a, b) for a, b in zip(cmp_df.spId, cmp_df.pos)])
+            st.dataframe(tbl[["선수", "games", "index", "verdict", "detail"]].rename(columns={
+                "games": "내 경기 수", "index": "랭커 대비(%)", "verdict": "판정", "detail": "세부 (나 vs 랭커)"}).round(0),
+                hide_index=True, width="stretch")
+        st.caption("랭커 = 공식경기 TOP 10,000이 같은 카드를 같은 포지션에 썼을 때의 평균 (넥슨 제공). "
+                   "공격수는 골·슈팅, 미드필더는 패스·도움·드리블, 수비수는 태클·패스 위주로 점수를 매겨요. "
+                   "100%면 랭커와 같은 수준이에요. 내가 5경기 이상 쓴 선수만 비교해요.")
+
+    # ---- 팀 변경 비교
+    st.subheader("② 팀 변경 비교: 팀을 바꾼 게 효과가 있었을까?")
+    det = deep.detect_change(pl, r["me"])
+    order = r["me"].sort_values("date").idx.tolist()
+    order = [m for m in order if m in set(pl.m)]
+    if len(order) < 16:
+        st.write(f"선수 기록이 있는 경기가 16경기 이상 필요해요 (지금 {len(order)}경기). 분석 경기 수를 늘려 보세요.")
+        return
+    dates = r["me"].set_index("idx").date
+    if det:
+        k_auto, changed, _ = det
+        st.markdown(f"주전이 **{changed}명** 바뀐 시점을 찾았어요: **{dates[order[k_auto]][:10]}** 경기부터 새 팀으로 봤어요.")
+    else:
+        k_auto = len(order) // 2
+        st.markdown("주전이 3명 이상 바뀐 시점을 찾지 못했어요. 아래에서 나눌 시점을 직접 고를 수 있어요.")
+    opts = list(range(8, len(order) - 8 + 1))
+    k = st.select_slider("새 팀 시작 경기 (직접 조정 가능)", options=opts,
+                         value=min(max(k_auto, opts[0]), opts[-1]),
+                         format_func=lambda i: dates[order[i]][:16], key=f"split_{r['nick']}")
+    before, after = order[:k], order[k:]
+
+    coef, flip, n_model = load_model()
+    shots_all = r["me_shots"] + r["op_shots"]
+    if flip is None:
+        flip = detect_flip(shots_all)
+    if not n_model:
+        coef = calibrate(DEFAULT_COEF, shots_all, flip)
+    xf, xa = per_match_xg(r, coef, flip)
+    me = r["me"].set_index("idx")
+    series = {"승률(%)": (me.win, True), "경기당 득점": (me.gf, True), "경기당 실점": (me.ga, False),
+              "찬스 창출 (xG)": (pd.Series(xf), True), "허용 찬스 (xG)": (pd.Series(xa), False),
+              "점유율(%)": (me.poss, None), "슈팅 수": (me.shots, True), "패스 성공률(%)": (me.pass_rate, True)}
+    rows = []
+    for name, (ser, hb) in series.items():
+        a, b = ser.reindex(before).values, ser.reindex(after).values
+        est, verdict = deep.segment_diff(a, b, True if hb is None else hb)
+        rows.append({"지표": name, f"이전 팀 ({len(before)}경기)": np.nanmean(a), f"새 팀 ({len(after)}경기)": np.nanmean(b),
+                     "변화": est, "판정": verdict if hb is not None else "스타일 지표"})
+    st.dataframe(pd.DataFrame(rows).round(2), hide_index=True, width="stretch")
+
+    pairs, out_p, in_p = deep.swap_pairs(pl, before, after)
+    if pairs:
+        st.markdown("**바뀐 선수끼리 비교** (빠진 선수는 이전 팀, 들어온 선수는 새 팀 기록)")
+        pb = deep.player_per_game(pl[pl.m.isin(before)], min_games=3)
+        pa = deep.player_per_game(pl[pl.m.isin(after)], min_games=3)
+        prow = []
+        for o, i in pairs:
+            if o in pb.index and i in pa.index:
+                ro, ri = pb.loc[o], pa.loc[i]
+                prow.append({"포지션": pnames.get(int(ri.pos), ri.pos), "빠진 선수": names.get(int(o), o),
+                             "들어온 선수": names.get(int(i), i),
+                             "평점": f"{ro.rating:.2f} → {ri.rating:.2f}",
+                             "경기당 골": f"{ro.goal:.2f} → {ri.goal:.2f}",
+                             "경기당 도움": f"{ro.assist:.2f} → {ri.assist:.2f}",
+                             "패스 성공률": f"{ro.pass_rate:.0f} → {ri.pass_rate:.0f}" if not pd.isna(ro.pass_rate) and not pd.isna(ri.pass_rate) else "-",
+                             "경기당 태클": f"{ro.tackle:.2f} → {ri.tackle:.2f}"})
+        if prow:
+            st.dataframe(pd.DataFrame(prow), hide_index=True, width="stretch")
+    st.caption("두 구간을 경기 단위로 재추출해서 비교했어요 (확실 95%, 가능성 80%). "
+               "같은 시기에 패치나 등급 변화가 있었다면 그 효과도 섞여 있을 수 있어요.")
+
 # ================================================================ 화면
 st.title("FC 전력분석실")
 
@@ -1360,7 +1501,7 @@ def run_with_status(nick, n, title):
     return r
 
 
-tab_scout, tab_me, tab_deep = st.tabs(["상대 스카우팅", "내 분석", "심층 분석"])
+tab_scout, tab_me, tab_deep, tab_pt = st.tabs(["상대 스카우팅", "내 분석", "심층 분석", "선수·팀"])
 
 with tab_scout:
     c1, c2 = st.columns([2, 1])
@@ -1423,6 +1564,16 @@ with tab_deep:
             st.error(dres)
         else:
             render_deep(dres, "other" if st.session_state.get("saved_me") and dres["nick"] != st.session_state.get("saved_me") else "self")
+
+with tab_pt:
+    st.caption("내 선수를 랭커들과 비교하고, 팀을 바꾼 전후를 비교해요. 팀 변경 비교는 경기가 많을수록 정확해서 80경기 이상을 추천해요.")
+    pn = st.text_input("닉네임", key="pt_nick", value=st.session_state.get("saved_me", ""))
+    pgames = st.select_slider("분석 경기 수", [30, 50, 80, 100], value=80, key="pt_n")
+    if st.button("선수·팀 분석", key="pt_btn", type="primary") and pn:
+        st.session_state.pt_result = run_with_status(pn, pgames, "선수·팀 분석")
+    pres = st.session_state.get("pt_result")
+    if pres is not None:
+        st.error(pres) if isinstance(pres, str) else render_players_team(pres, api_key)
 
 st.divider()
 st.caption("Data based on NEXON Open API")

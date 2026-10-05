@@ -244,3 +244,160 @@ def find_rules(me, min_n=8, z_min=2.0):
         if len(picked) >= 5:
             break
     return picked, n_all
+
+
+# ================================================================ 4. 랭커 비교
+def pos_group(pos):
+    pos = int(pos)
+    if pos == 0:
+        return "GK"
+    if 1 <= pos <= 8:
+        return "DF"
+    if 9 <= pos <= 19:
+        return "MF"
+    return "FW"
+
+
+def player_per_game(players, min_games=5):
+    """선수(카드+포지션)별 경기당 기록. players: analyze가 만든 선수 행 DataFrame."""
+    if players is None or players.empty:
+        return pd.DataFrame()
+    df = players.copy()
+    df["pos_main"] = df.groupby("spId")["pos"].transform(lambda s: s.mode().iat[0])
+    g = df.groupby("spId")
+    out = pd.DataFrame({
+        "pos": g["pos_main"].first(), "games": g.size(),
+        "goal": g["goal"].mean(), "assist": g["assist"].mean(), "shoot": g["shoot"].mean(),
+        "sot_rate": g["effectiveShoot"].sum() / g["shoot"].sum().replace(0, np.nan) * 100,
+        "pass_rate": g["passSuccess"].sum() / g["passTry"].sum().replace(0, np.nan) * 100,
+        "dribble_rate": g["dribbleSuccess"].sum() / g["dribbleTry"].sum().replace(0, np.nan) * 100,
+        "tackle": g["tackle"].mean(), "rating": g["spRating"].mean(),
+    })
+    return out[out.games >= min_games]
+
+
+# 포지션 그룹별로 볼 지표 (키, 이름, 가중치)
+GROUP_KEYS = {
+    "FW": [("goal", "경기당 골", 2), ("shoot", "경기당 슈팅", 1), ("sot_rate", "유효슈팅 비율(%)", 1),
+           ("assist", "경기당 도움", 1)],
+    "MF": [("pass_rate", "패스 성공률(%)", 2), ("assist", "경기당 도움", 1),
+           ("dribble_rate", "드리블 성공률(%)", 1), ("goal", "경기당 골", 1)],
+    "DF": [("tackle", "경기당 태클", 2), ("pass_rate", "패스 성공률(%)", 1)],
+    "GK": [("pass_rate", "패스 성공률(%)", 1)],
+}
+
+
+def ranker_row(status):
+    """랭커 기록(넥슨 ranker-stats의 status) → 같은 단위로 변환."""
+    st = status or {}
+    f = lambda k: float(st.get(k) or 0)
+    return {
+        "goal": f("goal"), "assist": f("assist"), "shoot": f("shoot"),
+        "sot_rate": f("effectiveShoot") / f("shoot") * 100 if f("shoot") else np.nan,
+        "pass_rate": f("passSuccess") / f("passTry") * 100 if f("passTry") else np.nan,
+        "dribble_rate": f("dribbleSuccess") / f("dribbleTry") * 100 if f("dribbleTry") else np.nan,
+        "tackle": f("tackle"), "matches": f("matchCount"),
+    }
+
+
+def ranker_compare(mine, rankers):
+    """mine: player_per_game 결과, rankers: {(spId, pos): ranker_row}. 선수별 판정."""
+    rows = []
+    for sp, r in mine.iterrows():
+        rk = rankers.get((int(sp), int(r.pos)))
+        if not rk:
+            continue
+        grp = pos_group(r.pos)
+        score, wsum, detail = 0.0, 0, []
+        for k, label, w in GROUP_KEYS[grp]:
+            a, b = r[k], rk[k]
+            if pd.isna(a) or pd.isna(b) or b == 0:
+                continue
+            ratio = a / b
+            score += w * np.clip(ratio, 0, 2)
+            wsum += w
+            detail.append(f"{label} {a:.2f} vs {b:.2f}" if "(%)" not in label else f"{label} {a:.0f} vs {b:.0f}")
+        if not wsum:
+            continue
+        idx = score / wsum  # 1.0 = 랭커와 같은 수준
+        verdict = "랭커보다 잘 씀" if idx >= 1.1 else "랭커 수준" if idx >= 0.85 else "못 살리는 중"
+        rows.append({"spId": int(sp), "pos": int(r.pos), "group": grp, "games": int(r.games),
+                     "index": idx * 100, "verdict": verdict, "detail": " · ".join(detail)})
+    return pd.DataFrame(rows).sort_values("index") if rows else pd.DataFrame()
+
+
+# ================================================================ 5. 팀 변경 비교
+def core_squad(players, ms, share=0.5):
+    """해당 경기들에서 절반 이상 선발로 나온 선수 = 주전."""
+    sub = players[players.m.isin(ms)]
+    cnt = sub.groupby("spId").m.nunique()
+    return set(cnt[cnt >= share * len(ms)].index)
+
+
+def detect_change(players, me, min_seg=8):
+    """선발 주전이 가장 많이 바뀐 시점을 찾음. 반환: (나누는 위치 k, 바뀐 인원, 시간순 경기 idx 목록)."""
+    if players is None or players.empty:
+        return None
+    order = me.sort_values("date").idx.tolist()  # 오래된 경기 → 최근 경기
+    order = [m for m in order if m in set(players.m)]
+    if len(order) < 2 * min_seg:
+        return None
+    xi = players.groupby("m").spId.apply(set).to_dict()  # 경기별 선발 명단
+    jac = lambda a, b: len(a & b) / len(a | b) if a | b else 0
+    best = None
+    for k in range(min_seg, len(order) - min_seg + 1):
+        a, b = core_squad(players, order[:k]), core_squad(players, order[k:])
+        changed = len(a - b)
+        # 각 경기 명단이 자기 구간 주전과 얼마나 더 닮았는지 (나누는 시점이 정확할수록 높음)
+        purity = np.mean([jac(xi[m], a) - jac(xi[m], b) for m in order[:k]] +
+                         [jac(xi[m], b) - jac(xi[m], a) for m in order[k:]])
+        if best is None or (changed, purity) > (best[1], best[2]):
+            best = (k, changed, purity)
+    if best is None or best[1] < 3:
+        return None
+    return best[0], best[1], order
+
+
+def swap_pairs(players, before, after):
+    """빠진 주전과 들어온 주전을 포지션으로 짝지음."""
+    a, b = core_squad(players, before), core_squad(players, after)
+    out_p, in_p = a - b, b - a
+    pos = players.groupby("spId").pos.agg(lambda s: int(s.mode().iat[0]))
+    pairs, used = [], set()
+    for o in sorted(out_p, key=lambda x: pos.get(x, 99)):
+        cands = [i for i in in_p if i not in used]
+        if not cands:
+            break
+        exact = [i for i in cands if pos.get(i) == pos.get(o)]
+        same_grp = [i for i in cands if pos_group(pos.get(i, 25)) == pos_group(pos.get(o, 25))]
+        pick = (exact or same_grp or [None])[0]
+        if pick is not None:
+            used.add(pick)
+            pairs.append((o, pick))
+    return pairs, out_p, in_p
+
+
+def segment_diff(arr_before, arr_after, higher_better=True, n_boot=2000, seed=0):
+    """두 구간 평균 차이(이후 − 이전)의 부트스트랩 판정."""
+    a, b = np.asarray(arr_before, float), np.asarray(arr_after, float)
+    a, b = a[~np.isnan(a)], b[~np.isnan(b)]
+    if len(a) < 5 or len(b) < 5:
+        return np.nan, "판단 보류"
+    rng = np.random.default_rng(seed)
+    d = rng.choice(b, (n_boot, len(b))).mean(1) - rng.choice(a, (n_boot, len(a))).mean(1)
+    if not higher_better:
+        d = -d
+    lo95, hi95 = np.percentile(d, [2.5, 97.5])
+    lo80, hi80 = np.percentile(d, [10, 90])
+    est = b.mean() - a.mean()
+    if lo95 > 0:
+        v = "확실히 좋아짐"
+    elif hi95 < 0:
+        v = "확실히 나빠짐"
+    elif lo80 > 0:
+        v = "좋아졌을 가능성"
+    elif hi80 < 0:
+        v = "나빠졌을 가능성"
+    else:
+        v = "차이 없음"
+    return est, v
