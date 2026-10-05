@@ -47,6 +47,8 @@ def refresh_users(limit=200):
             nick = api.basic(ouid).get("nickname") if old else None
             divs = api.maxdivision(ouid)
         except ApiError as e:
+            if e.status == 429:
+                raise BudgetExceeded()
             if e.status in (400, 404):  # 없어진 계정 → 삭제
                 cur.execute("delete from users where ouid=%s", (ouid,))
                 cur.execute("delete from crawl_queue where ouid=%s", (ouid,))
@@ -71,6 +73,8 @@ def crawl_recent(buffer, share=0.4):
         try:
             ids = api.recent_matches(MTYPE, limit=100, offset=offset)
         except ApiError as e:
+            if e.status == 429:
+                raise BudgetExceeded()
             log("최근 경기 목록 조회 실패 (눈덩이 방식만 사용):", e)
             return
         if not ids:
@@ -83,8 +87,9 @@ def crawl_recent(buffer, share=0.4):
             if mid not in have and mid not in buffer:
                 try:
                     buffer[mid] = api.detail(mid)
-                except ApiError:
-                    pass
+                except ApiError as e:
+                    if e.status == 429:
+                        raise BudgetExceeded()
         offset += len(ids)
     log("전체 최근 경기에서 가져온 경기:", len(buffer), "| 사용한 파라미터:", api._recent_params)
 
@@ -95,7 +100,12 @@ def crawl(buffer):
     cur.execute("select ouid from crawl_queue where done_at is null "
                 "or done_at < now() - interval '3 days' order by done_at nulls first limit 200")
     for (ouid,) in cur.fetchall():
-        ids = api.matches(ouid, MTYPE, limit=20)
+        try:
+            ids = api.matches(ouid, MTYPE, limit=20)
+        except ApiError as e:
+            if e.status == 429:
+                raise BudgetExceeded()
+            ids = []
         if ids:
             cur.execute("select match_id from matches where match_id = any(%s)", (ids,))
             have = {r[0] for r in cur.fetchall()}
@@ -103,8 +113,9 @@ def crawl(buffer):
                 if mid not in have and mid not in buffer:
                     try:
                         buffer[mid] = api.detail(mid)
-                    except ApiError:
-                        pass
+                    except ApiError as e:
+                        if e.status == 429:
+                            raise BudgetExceeded()
         cur.execute("update crawl_queue set done_at=now() where ouid=%s", (ouid,))
 
 
@@ -189,7 +200,7 @@ try:
     refresh_users(limit=max(20, api.max_calls // 4))   # 2) 등급 정보 (예산 약 25%)
     crawl(buffer)                                      # 3) 남은 예산으로 눈덩이 수집
 except BudgetExceeded:
-    log("호출 예산 소진:", api.calls)
+    log("호출 예산 소진 또는 넥슨 요청 한도 도달 → 지금까지 모은 것만 저장하고 종료:", api.calls)
 finally:
     save(buffer)
     retrain()

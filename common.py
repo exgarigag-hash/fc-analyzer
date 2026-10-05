@@ -39,6 +39,8 @@ class Nexon:
             r = requests.get(BASE + path, params=params,
                              headers={"x-nxopen-api-key": self.key}, timeout=15)
             if r.status_code == 429:
+                if attempt >= 2:  # 세 번 연속이면 한도에 걸린 것 → 오래 기다리지 않고 포기
+                    break
                 time.sleep(1.0 * (attempt + 1))
                 continue
             if r.status_code != 200:
