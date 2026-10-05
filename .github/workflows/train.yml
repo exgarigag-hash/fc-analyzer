@@ -1,0 +1,19 @@
+name: train
+on:
+  schedule:
+    - cron: "0 19 * * *"   # 매일 한국 시간 새벽 4시
+  workflow_dispatch:
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests numpy pandas lightgbm "psycopg[binary]"
+      - run: python train_model.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MIN_MATCHES: ${{ vars.MIN_MATCHES || '5000' }}
