@@ -27,24 +27,28 @@ st.set_page_config(page_title="FC 전력분석실", page_icon="⚽", layout="wid
 
 # ================================================================ API
 class ApiError(Exception):
-    pass
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status
 
 
 def _get(path, params, key):
     for attempt in range(5):
         r = requests.get(BASE + path, params=params,
                          headers={"x-nxopen-api-key": key}, timeout=15)
-        if r.status_code == 429:  # 요청 한도 → 잠깐 쉬고 재시도
-            time.sleep(0.7 * (attempt + 1))
+        if r.status_code == 429:  # 요청 한도 → 잠깐 쉬고 재시도 (계속이면 하루 한도 소진)
+            if attempt >= 1:
+                break
+            time.sleep(0.7)
             continue
         if r.status_code != 200:
             try:
                 msg = r.json().get("error", {}).get("message", r.text)
             except Exception:
                 msg = r.text
-            raise ApiError(f"{r.status_code}: {msg}")
+            raise ApiError(f"{r.status_code}: {msg}", r.status_code)
         return r.json()
-    raise ApiError("요청 한도를 넘었어요. 잠시 후 다시 시도하세요.")
+    raise ApiError("넥슨 API 요청 한도를 넘었어요.", 429)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -79,20 +83,25 @@ def fetch_details(ids, key, label):
     """여러 경기 상세를 동시에 불러와서 로딩 시간을 줄임."""
     store = detail_store()
     todo = [m for m in ids if m not in store]
-    if todo:
+    if todo:  # DB에 저장된 경기는 넥슨 호출 없이 꺼내 씀
+        store.update(details_from_db(tuple(todo)))
+        todo = [m for m in todo if m not in store]
+    if todo and not st.session_state.get("api_exhausted"):
         bar = st.progress(0.0, text=label)
 
         def work(mid):
             try:
                 return mid, _get("/fconline/v1/match-detail", {"matchid": mid}, key)
-            except ApiError:
-                return mid, None
+            except ApiError as e:
+                return mid, ("LIMIT" if e.status == 429 else None)
 
-        with ThreadPoolExecutor(max_workers=5) as ex:
+        with ThreadPoolExecutor(max_workers=3) as ex:
             futs = [ex.submit(work, m) for m in todo]
             for i, f in enumerate(as_completed(futs), 1):
                 mid, d = f.result()
-                if d:
+                if d == "LIMIT":
+                    st.session_state.api_exhausted = True
+                elif d:
                     store[mid] = d
                 bar.progress(i / len(todo), text=f"{label} ({i}/{len(todo)})")
         bar.empty()
@@ -303,20 +312,40 @@ def style_tags(me, bm):
 
 def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
     """닉네임 → 분석 결과 dict. 실패하면 에러 문자열."""
+    offline = False
     try:
         ouid = get_ouid(nick.strip(), key)
     except ApiError as e:
-        return f"'{nick}' 닉네임을 찾지 못했어요. 철자를 확인하세요. ({e})"
-    try:
-        ids = get_matches(ouid, mtype, n, key)
-    except ApiError as e:
-        return f"경기 목록을 불러오지 못했어요. API 키와 경기 종류를 확인하세요. ({e})"
+        ouid = db_find_ouid(nick.strip()) if e.status == 429 else None
+        if ouid is None:
+            if e.status == 429:
+                return (f"오늘 넥슨 API 한도를 다 써서 새로 조회할 수 없고, '{nick}'의 경기도 DB에 없어요. "
+                        "한도가 초기화된 뒤 다시 시도하세요.")
+            return f"'{nick}' 닉네임을 찾지 못했어요. 철자를 확인하세요. ({e})"
+        offline = True
+    if not offline:
+        try:
+            ids = get_matches(ouid, mtype, n, key)
+        except ApiError as e:
+            if e.status != 429:
+                return f"경기 목록을 불러오지 못했어요. API 키와 경기 종류를 확인하세요. ({e})"
+            offline = True
+    if offline:  # 한도 소진 → DB에 쌓인 경기로 분석
+        st.session_state.api_exhausted = True
+        ids = db_match_ids(ouid, mtype, n)
+        if len(ids) < 3:
+            return (f"오늘 넥슨 API 한도를 다 썼고, DB에 '{nick}'의 경기가 {len(ids)}개뿐이라 분석이 어려워요. "
+                    "한도가 초기화된 뒤 다시 시도하세요.")
+        st.info(f"오늘 넥슨 API 한도를 다 써서, DB에 저장된 '{nick}'의 경기 {len(ids)}개로 분석했어요. "
+                "최신 경기가 빠져 있을 수 있고 선수별 기록은 비어 있을 수 있어요.")
     details = fetch_details(ids, key, label)
     db_save(details, ouid)
     try:
+        if offline:
+            raise ApiError("offline", 429)
         best = next((d for d in get_maxdiv(ouid, key) if d.get("matchType") == mtype), {})
     except ApiError:
-        best = {}
+        best = db_user_division(ouid)
     max_div, max_date = best.get("division"), (best.get("achievementDate") or "")[:10]
     opp_ouids = tuple(sorted({x.get("ouid") for d in details for x in d.get("matchInfo") or []
                               if x.get("ouid") != ouid}))
@@ -571,6 +600,100 @@ def tier_table(mtype):
         return df if len(df) else None
     except Exception:
         return None
+
+
+
+# ---------------------------------------------------------------- DB에서 경기 꺼내 쓰기 (넥슨 호출 절약)
+SIDE_MAP = {  # DB 열 → 넥슨 응답 구조
+    "matchDetail": {"matchResult": "result", "possession": "possession", "foul": "fouls",
+                    "averageRating": "rating", "OffsideCount": "offside", "controller": "controller"},
+    "shoot": {"shootTotal": "shots", "effectiveShootTotal": "sot", "goalTotal": "gf",
+              "goalTotalDisplay": "gf", "shootInPenalty": "shots_box", "shootHeading": "shots_head"},
+    "pass": {"passTry": "pass_try", "passSuccess": "pass_succ", "throughPassTry": "through_try",
+             "throughPassSuccess": "through_succ", "longPassTry": "long_try"},
+    "defence": {"tackleTry": "tackle_try", "tackleSuccess": "tackle_succ",
+                "blockTry": "block_try", "blockSuccess": "block_succ"},
+}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def details_from_db(match_ids):
+    """DB에 저장된 경기를 넥슨 응답과 같은 모양으로 복원 (선수별 기록은 저장 안 해서 비어 있음)."""
+    cur = cursor()
+    if cur is None or not match_ids:
+        return {}
+    try:
+        cur.execute("select match_id, match_type, match_date from matches where match_id = any(%s)",
+                    (list(match_ids),))
+        ms = {r[0]: r for r in cur.fetchall()}
+        if not ms:
+            return {}
+        cur.execute("select * from match_sides where match_id = any(%s)", (list(ms),))
+        cols = [c.name for c in cur.description]
+        sides = [dict(zip(cols, r)) for r in cur.fetchall()]
+        cur.execute("select match_id, ouid, x, y, type, result, in_penalty, goal_time, assisted, "
+                    "assist_x, assist_y from shots where match_id = any(%s)", (list(ms),))
+        shots = {}
+        for mid, o, x, y, t, res, ip, gt, a, ax, ay in cur.fetchall():
+            shots.setdefault((mid, o), []).append(
+                {"x": x, "y": y, "type": t, "result": res, "inPenalty": ip, "goalTime": gt or 0,
+                 "assist": a, "assistX": ax, "assistY": ay})
+        out = {}
+        for mid, mt, md in ms.values():
+            info = []
+            for sd in (x for x in sides if x["match_id"] == mid):
+                side = {"ouid": sd["ouid"], "nickname": sd["nickname"], "player": [],
+                        "shootDetail": shots.get((mid, sd["ouid"]), [])}
+                for part, mp in SIDE_MAP.items():
+                    side[part] = {k: sd.get(v) for k, v in mp.items()}
+                side["matchDetail"]["matchEndType"] = 0
+                info.append(side)
+            if len(info) == 2:
+                out[mid] = {"matchId": mid, "matchType": mt,
+                            "matchDate": md.strftime("%Y-%m-%dT%H:%M:%S") if md else "",
+                            "matchInfo": info}
+        return out
+    except Exception:
+        return {}
+
+
+def db_find_ouid(nick):
+    cur = cursor()
+    if cur is None:
+        return None
+    try:
+        cur.execute("select ouid from users where nickname = %s limit 1", (nick,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def db_match_ids(ouid, mtype, n):
+    cur = cursor()
+    if cur is None:
+        return []
+    try:
+        cur.execute("select m.match_id from match_sides ms join matches m using (match_id) "
+                    "where ms.ouid = %s and m.match_type = %s order by m.match_date desc limit %s",
+                    (ouid, mtype, n))
+        return [r[0] for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def db_user_division(ouid):
+    cur = cursor()
+    if cur is None:
+        return {}
+    try:
+        cur.execute("select max_division, max_division_date from users where ouid = %s", (ouid,))
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return {}
+        return {"division": row[0], "achievementDate": row[1].strftime("%Y-%m-%d") if row[1] else ""}
+    except Exception:
+        return {}
 
 
 # ================================================================ 진단 (xG 분해)
