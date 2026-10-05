@@ -1251,15 +1251,25 @@ def render_deep(r, mode="self"):
         st.write("어시스트 정보가 있는 슈팅이 아직 적어서 루트를 분류할 수 없어요. "
                  "한도가 남아 있을 때 분석하면 넥슨에서 새로 받아온 경기로 분류해요.")
     with st.expander("데이터 확인 (개발용)"):
-        src = pd.Series([d.get("_src", "api") for d in r["details"]]).value_counts().to_dict()
-        st.write(f"경기 출처: 넥슨에서 새로 받은 경기 {src.get('api', 0)}개 · DB에서 꺼낸 경기 {src.get('db', 0)}개")
-        sample = next((x.get("shootDetail")[0] for d in r["details"] if d.get("_src") != "db"
-                       for x in d.get("matchInfo") or [] if x.get("shootDetail")), None)
-        if sample:
-            st.write("넥슨 원본 슈팅 기록 1개 (필드 이름 확인용)")
-            st.json(sample)
-        else:
-            st.write("넥슨에서 새로 받은 경기가 없어서 원본 필드를 보여줄 수 없어요. 처음 보는 닉네임으로 분석하면 보여요.")
+        st.write("앱에 저장된 기록이 아니라 넥슨에서 경기 1개를 직접 새로 받아서, 슈팅 기록의 실제 필드 이름을 보여줘요.")
+        if st.button("넥슨 원본 1경기 받아보기 (호출 1건)", key=f"raw_{r['nick']}"):
+            try:
+                mid = r["details"][0]["matchId"]
+                raw = _get("/fconline/v1/match-detail", {"matchid": mid}, st.session_state.api_key)
+                shots = [x for side in raw.get("matchInfo") or [] for x in side.get("shootDetail") or []]
+                keys = sorted({k for x in shots for k in x})
+                st.session_state.raw_check = {"keys": keys, "n": len(shots),
+                                              "samples": [x for x in shots if x.get("inPenalty")][:2] or shots[:2]}
+            except Exception as e:
+                st.session_state.raw_check = {"error": str(e)}
+        rc = st.session_state.get("raw_check")
+        if rc:
+            if "error" in rc:
+                st.error(rc["error"])
+            else:
+                st.write(f"슈팅 {rc['n']}개의 필드 이름: " + ", ".join(rc["keys"]))
+                for x in rc["samples"]:
+                    st.json(x)
     for t in deep.route_insights(att, dfd, pop):
         st.markdown("- " + t)
     if len(att) and len(dfd):
