@@ -584,11 +584,16 @@ def estimate_tier(opp_ouids):
         return None, 0
     try:
         cur.execute("""
-          select percentile_disc(0.5) within group (order by max_division)
-                   filter (where max_division_date > now() - interval '90 days'),
-                 count(*) filter (where max_division_date > now() - interval '90 days'),
-                 percentile_disc(0.5) within group (order by max_division), count(*)
-          from users where ouid = any(%s) and max_division is not null""", (list(opp_ouids),))
+          with t as (
+            select u.ouid,
+                   coalesce(c.cur_division, u.max_division) as d,
+                   (c.cur_division is not null or u.max_division_date > now() - interval '90 days') as recent
+            from users u left join user_cur_division c on c.ouid = u.ouid and c.match_type = 50
+            where u.ouid = any(%s))
+          select percentile_disc(0.5) within group (order by d) filter (where recent),
+                 count(*) filter (where recent),
+                 percentile_disc(0.5) within group (order by d), count(*)
+          from t where d is not null""", (list(opp_ouids),))
         v_recent, n_recent, v_all, n_all = cur.fetchone()
         if n_recent >= 5:
             return v_recent, n_recent
@@ -647,7 +652,8 @@ def details_from_db(match_ids):
             shots.setdefault((mid, o), []).append(
                 {"x": x, "y": y, "type": t, "result": res, "inPenalty": ip, "goalTime": gt or 0,
                  # 어시스트 좌표 칸이 생긴 뒤 저장된 슈팅만 판단 (그 전 행은 정보 없음)
-                 "assist": None if ax is None or a is None else bool(a),
+                 # (0.5, 0.5)는 넥슨의 '어시스트 없음' 기본 좌표 → 잠깐 잘못 저장된 행도 바로잡음
+                 "assist": None if ax is None or a is None else bool(a) and not (ax == 0.5 and ay == 0.5),
                  "assistX": ax, "assistY": ay})
         players = {}
         try:
@@ -1225,7 +1231,7 @@ def pop_route_share(flip):
         if len(rows) < 2000:
             return None
         routes = pd.Series([deep.classify_route({"x": x, "y": y, "inPenalty": ip,
-                                                 "assist": bool(a),
+                                                 "assist": bool(a) and not (ax == 0.5 and ay == 0.5),
                                                  "assistX": ax, "assistY": ay}, flip)
                             for x, y, ip, a, ax, ay in rows])
         return routes.value_counts(normalize=True) * 100
