@@ -37,25 +37,56 @@ def register_seeds():
 
 
 def refresh_users(limit=200):
-    """새 유저는 등급 조회, 25일 지난 유저는 닉네임·등급 갱신."""
-    cur.execute("select ouid from users where refreshed_at is null "
+    """새 유저는 등급만 조회(호출 1번), 25일 지난 유저는 닉네임까지 갱신(호출 2번)."""
+    cur.execute("select ouid, refreshed_at is not null from users where refreshed_at is null "
                 "or refreshed_at < now() - interval '25 days' "
                 "order by refreshed_at nulls first limit %s", (limit,))
     n = 0
-    for (ouid,) in cur.fetchall():
+    for ouid, old in cur.fetchall():
         try:
-            nick = api.basic(ouid).get("nickname")
+            nick = api.basic(ouid).get("nickname") if old else None
             divs = api.maxdivision(ouid)
         except ApiError as e:
             if e.status in (400, 404):  # 없어진 계정 → 삭제
                 cur.execute("delete from users where ouid=%s", (ouid,))
                 cur.execute("delete from crawl_queue where ouid=%s", (ouid,))
             continue
-        div = next((d.get("division") for d in divs if d.get("matchType") == MTYPE), None)
-        cur.execute("update users set nickname=%s, max_division=%s, refreshed_at=now() where ouid=%s",
-                    (nick, div, ouid))
+        main = next((d for d in divs if d.get("matchType") == MTYPE), {})
+        cur.execute("update users set nickname=coalesce(%s, nickname), max_division=%s, "
+                    "max_division_date=%s, refreshed_at=now() where ouid=%s",
+                    (nick, main.get("division"), main.get("achievementDate"), ouid))
+        cur.executemany(
+            "insert into user_divisions(ouid, match_type, division, achieved_at) values (%s,%s,%s,%s) "
+            "on conflict (ouid, match_type, division) do update set seen_at=now()",
+            [(ouid, d.get("matchType"), d.get("division"), d.get("achievementDate")) for d in divs])
         n += 1
-    log("유저 갱신:", n)
+    log("유저 등급 갱신:", n)
+
+
+def crawl_recent(buffer, share=0.4):
+    """검색 없이 전체 유저의 최근 경기를 무작위 표본처럼 수집 (예산의 40%까지)."""
+    stop = api.calls + int((api.max_calls or 900) * share)
+    offset = 0
+    while api.calls < stop:
+        try:
+            ids = api.recent_matches(MTYPE, limit=100, offset=offset)
+        except ApiError as e:
+            log("최근 경기 목록 조회 실패 (눈덩이 방식만 사용):", e)
+            return
+        if not ids:
+            break
+        cur.execute("select match_id from matches where match_id = any(%s)", (ids,))
+        have = {r[0] for r in cur.fetchall()}
+        for mid in ids:
+            if api.calls >= stop:
+                break
+            if mid not in have and mid not in buffer:
+                try:
+                    buffer[mid] = api.detail(mid)
+                except ApiError:
+                    pass
+        offset += 100
+    log("전체 최근 경기에서 가져온 경기:", len(buffer))
 
 
 def crawl(buffer):
@@ -93,6 +124,7 @@ def save(buffer):
         cur.executemany("insert into crawl_queue(ouid) values (%s) on conflict do nothing",
                         [(o,) for o in ouids if o])
     log("새 경기 저장:", new)
+    buffer.clear()
 
 
 def retrain():
@@ -133,11 +165,27 @@ def rollup_and_purge():
     log("갱신 안 된 유저 삭제:", cur.rowcount)
 
 
+def diagnostics():
+    from urllib.parse import urlparse
+    u = urlparse(os.environ["DATABASE_URL"])
+    log("접속한 DB:", f"{u.username}@{u.hostname}")  # 비밀번호는 출력 안 함
+    seeds = [n for n in os.environ.get("SEED_NICKNAMES", "").split(",") if n.strip()]
+    log("시드 닉네임:", len(seeds), "개")
+    for t in ("matches", "shots", "users", "crawl_queue"):
+        cur.execute(f"select count(*) from {t}")
+        log(f"현재 {t}:", cur.fetchone()[0])
+    if not seeds:
+        log("참고: SEED_NICKNAMES 없이 전체 최근 경기부터 수집해요.")
+
+
 buffer = {}
+diagnostics()
 try:
     register_seeds()
-    refresh_users(limit=max(20, api.max_calls // 4))
-    crawl(buffer)
+    crawl_recent(buffer)                               # 1) 검색 없이 무작위 수집
+    save(buffer)                                       #    → 저장해야 2), 3)에서 이 유저들을 씀
+    refresh_users(limit=max(20, api.max_calls // 4))   # 2) 등급 정보 (예산 약 25%)
+    crawl(buffer)                                      # 3) 남은 예산으로 눈덩이 수집
 except BudgetExceeded:
     log("호출 예산 소진:", api.calls)
 finally:

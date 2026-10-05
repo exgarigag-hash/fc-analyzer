@@ -62,6 +62,11 @@ class Nexon:
         return self.get("/fconline/v1/user/match",
                         {"ouid": ouid, "matchtype": mtype, "offset": offset, "limit": limit})
 
+    def recent_matches(self, mtype, limit=100, offset=0):
+        """매치 종류별 최근 경기 목록 (특정 유저 없이 전체에서 가져옴)."""
+        return self.get("/fconline/v1/match", {"matchtype": mtype, "offset": offset,
+                                               "limit": limit, "orderby": "desc"})
+
     def detail(self, mid):
         return self.get("/fconline/v1/match-detail", {"matchid": mid})
 
@@ -166,7 +171,7 @@ def fit_logit(X, y, l2=1.0, iters=30):
 # ================================================================ DB (Supabase Postgres)
 def db_connect(url):
     import psycopg
-    return psycopg.connect(url, autocommit=True, prepare_threshold=None)
+    return psycopg.connect(url, autocommit=True, prepare_threshold=None, connect_timeout=8)
 
 
 SIDE_COLS = ["ouid", "nickname", "result", "gf", "ga", "shots", "sot", "shots_box",
