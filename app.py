@@ -666,7 +666,7 @@ def details_from_db(match_ids):
                 side["matchDetail"]["matchEndType"] = 0
                 info.append(side)
             if len(info) == 2:
-                out[mid] = {"matchId": mid, "matchType": mt,
+                out[mid] = {"_src": "db", "matchId": mid, "matchType": mt,
                             "matchDate": md.strftime("%Y-%m-%dT%H:%M:%S") if md else "",
                             "matchInfo": info}
         return out
@@ -1250,6 +1250,16 @@ def render_deep(r, mode="self"):
     if att.empty:
         st.write("어시스트 정보가 있는 슈팅이 아직 적어서 루트를 분류할 수 없어요. "
                  "한도가 남아 있을 때 분석하면 넥슨에서 새로 받아온 경기로 분류해요.")
+    with st.expander("데이터 확인 (개발용)"):
+        src = pd.Series([d.get("_src", "api") for d in r["details"]]).value_counts().to_dict()
+        st.write(f"경기 출처: 넥슨에서 새로 받은 경기 {src.get('api', 0)}개 · DB에서 꺼낸 경기 {src.get('db', 0)}개")
+        sample = next((x.get("shootDetail")[0] for d in r["details"] if d.get("_src") != "db"
+                       for x in d.get("matchInfo") or [] if x.get("shootDetail")), None)
+        if sample:
+            st.write("넥슨 원본 슈팅 기록 1개 (필드 이름 확인용)")
+            st.json(sample)
+        else:
+            st.write("넥슨에서 새로 받은 경기가 없어서 원본 필드를 보여줄 수 없어요. 처음 보는 닉네임으로 분석하면 보여요.")
     for t in deep.route_insights(att, dfd, pop):
         st.markdown("- " + t)
     if len(att) and len(dfd):

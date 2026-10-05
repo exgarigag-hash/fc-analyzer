@@ -48,7 +48,8 @@ def route_table(shots, coef, flip, n_matches):
     xs = xg_values(shots, coef, flip)
     df = pd.DataFrame({"route": [classify_route(s, flip) for s in shots], "xg": xs,
                        "goal": [s.get("result") == 3 for s in shots]})
-    known = df.route != "unknown"
+    # 어시스트 정보가 있는 슈팅만 사용 (박스 밖 슈팅도 같은 기준으로 걸러야 비중이 안 틀어짐)
+    known = pd.Series([has_assist(s) is not None for s in shots]).values
     route_table.coverage = float(known.mean()) if len(df) else 0.0  # 분류 가능한 슈팅 비율
     if known.sum() < 20:
         return pd.DataFrame()
