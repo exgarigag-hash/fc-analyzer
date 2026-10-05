@@ -111,6 +111,7 @@ def side_row(s, o):
         "possession": md.get("possession"), "fouls": md.get("foul", 0),
         "offside": md.get("OffsideCount", 0), "rating": md.get("averageRating"),
         "controller": md.get("controller"),
+        "division": s.get("division") or None,  # 경기 당시 등급 (넥슨이 주는 경우만)
     }
 
 
@@ -134,18 +135,17 @@ DEFAULT_COEF = {"b0": -0.5, "dist": -0.11, "angle": 1.3, "header": -0.8}
 
 
 def has_assist(s):
-    """어시스트가 있었던 슈팅인지. 넥슨 응답에 'assist' 값이 없고 assistSpId·assistX만 오는 경우가 있어서
-    여러 단서를 같이 봄. 판단할 단서가 하나도 없으면 None(알 수 없음)."""
-    a, sp, ax, ay = s.get("assist"), s.get("assistSpId"), s.get("assistX"), s.get("assistY")
-    if a is None and sp is None and ax is None:
-        return None
-    if a:
-        return True
-    if sp not in (None, 0, -1):
-        return True
-    if ax is not None and ((ax or 0) > 0 or (ay or 0) > 0):
-        return True
-    return False
+    """어시스트가 있었던 슈팅인지 (넥슨 문서 기준).
+    - assist: true/false 가 기본 판단 기준
+    - 어시스트가 없으면 assistSpI = -1, assistX/Y = 0.5 (기본값)이 들어옴
+    판단할 단서가 하나도 없으면 None(알 수 없음)."""
+    a = s.get("assist")
+    if a is not None:
+        return bool(a)
+    sp = s.get("assistSpI", s.get("assistSpId"))
+    if sp is not None:
+        return sp not in (0, -1)
+    return None
 
 
 def shot_features(s, flip=False):
@@ -217,7 +217,7 @@ def db_connect(url):
 SIDE_COLS = ["ouid", "nickname", "result", "gf", "ga", "shots", "sot", "shots_box",
              "shots_head", "pass_try", "pass_succ", "through_try", "through_succ", "long_try",
              "tackle_try", "tackle_succ", "block_try", "block_succ", "possession", "fouls",
-             "offside", "rating", "controller"]
+             "offside", "rating", "controller", "division"]
 
 
 # 넥슨 선수 기록 키 → DB 열 이름
@@ -225,7 +225,7 @@ PLAYER_FIELDS = {
     "shoot": "shoot", "effectiveShoot": "effective_shoot", "goal": "goal", "assist": "assist",
     "passTry": "pass_try", "passSuccess": "pass_success", "dribbleTry": "dribble_try",
     "dribbleSuccess": "dribble_success", "dribble": "dribble",
-    "ballPossesionTry": "ball_possesion_try", "ballPossesionSuccess": "ball_possesion_success",
+    "ballPossesionTry": "ball_possesion_try", "ballPossesionSuc": "ball_possesion_success",
     "aerialTry": "aerial_try", "aerialSuccess": "aerial_success", "tackleTry": "tackle_try",
     "tackle": "tackle", "blockTry": "block_try", "block": "block", "intercept": "intercept",
     "defending": "defending", "yellowCards": "yellow_cards", "redCards": "red_cards",
@@ -237,6 +237,7 @@ def player_rows(match_id, side):
     rows = []
     for p in side.get("player") or []:
         st = p.get("status") or {}
+        st.setdefault("ballPossesionSuc", st.get("ballPossesionSuccess"))  # 문서와 실제 이름이 다를 때 대비
         rows.append((match_id, side.get("ouid"), p.get("spId"), p.get("spPosition"), p.get("spGrade"),
                      *[st.get(k) for k in PLAYER_FIELDS]))
     return rows

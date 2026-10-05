@@ -352,8 +352,14 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
     opp_ouids = tuple(sorted({x.get("ouid") for d in details for x in d.get("matchInfo") or []
                               if x.get("ouid") != ouid}))
     est_div, n_opp = estimate_tier(opp_ouids)
+    # 경기 기록에 경기 당시 등급이 있으면 그게 가장 정확 (최근 경기 기준)
+    recent_divs = [x.get("division") for d in sorted(details, key=lambda d: d.get("matchDate", ""), reverse=True)[:10]
+                   for x in d.get("matchInfo") or [] if x.get("ouid") == ouid and x.get("division")]
+    match_div = pd.Series(recent_divs).mode().iat[0] if recent_divs else None
     recent_max = bool(max_date) and max_date >= (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
-    if recent_max:  # 최근에 최고 등급을 찍었으면 그게 현재 등급에 가장 가까움
+    if match_div:  # 경기 기록상 등급
+        est_div, n_opp = int(match_div), -2
+    elif recent_max:  # 최근에 최고 등급을 찍었으면 그게 현재 등급에 가장 가까움
         est_div, n_opp = max_div, -1
     division = est_div or max_div
     details.sort(key=lambda d: d.get("matchDate", ""), reverse=True)
@@ -640,8 +646,8 @@ def details_from_db(match_ids):
         for mid, o, x, y, t, res, ip, gt, a, ax, ay in cur.fetchall():
             shots.setdefault((mid, o), []).append(
                 {"x": x, "y": y, "type": t, "result": res, "inPenalty": ip, "goalTime": gt or 0,
-                 # 어시스트 좌표가 저장된 슈팅만 판단 가능 (예전 행은 assisted가 기본값 False라 믿지 않음)
-                 "assist": None if ax is None else bool(a) or (ax or 0) > 0 or (ay or 0) > 0,
+                 # 어시스트 좌표 칸이 생긴 뒤 저장된 슈팅만 판단 (그 전 행은 정보 없음)
+                 "assist": None if ax is None or a is None else bool(a),
                  "assistX": ax, "assistY": ay})
         players = {}
         try:
@@ -658,7 +664,7 @@ def details_from_db(match_ids):
         for mid, mt, md in ms.values():
             info = []
             for sd in (x for x in sides if x["match_id"] == mid):
-                side = {"ouid": sd["ouid"], "nickname": sd["nickname"],
+                side = {"ouid": sd["ouid"], "nickname": sd["nickname"], "division": sd.get("division"),
                         "player": players.get((mid, sd["ouid"]), []),
                         "shootDetail": shots.get((mid, sd["ouid"]), [])}
                 for part, mp in SIDE_MAP.items():
@@ -855,7 +861,9 @@ def render_tier(r):
     names = div_names()
     est, mx = r.get("est_div"), r.get("max_div")
     line = []
-    if est and r.get("n_opp") == -1:
+    if est and r.get("n_opp") == -2:
+        line.append(f"현재 등급 **{names.get(est, est)}** (최근 경기 기록 기준)")
+    elif est and r.get("n_opp") == -1:
         line.append(f"현재 등급 **{names.get(est, est)}** (최근 90일 안에 달성한 최고 등급)")
     elif est:
         line.append(f"추정 현재 등급 **{names.get(est, est)}** (최근 상대 {r['n_opp']}명의 등급 기준)")
@@ -1113,7 +1121,7 @@ def render_full(r, mode):
     nick = r["nick"]
     names = div_names()
     best_txt = names.get(r.get("est_div") or r.get("max_div"), "-")
-    best_label = "추정 현재 등급" if r.get("est_div") else "역대 최고 등급"
+    best_label = ("현재 등급" if r.get("n_opp") in (-1, -2) else "추정 현재 등급") if r.get("est_div") else "역대 최고 등급"
     w, dr = (me.result == "승").sum(), (me.result == "무").sum()
     l = len(me) - w - dr
     c1, c2, c3, c4 = st.columns(4)
@@ -1212,12 +1220,12 @@ def pop_route_share(flip):
         return None
     try:
         cur.execute("select x, y, in_penalty, assisted, assist_x, assist_y from shots "
-                    "where assist_x is not null")
+                    "where assist_x is not null and assisted is not null")
         rows = cur.fetchall()
         if len(rows) < 2000:
             return None
         routes = pd.Series([deep.classify_route({"x": x, "y": y, "inPenalty": ip,
-                                                 "assist": bool(a) or (ax or 0) > 0 or (ay or 0) > 0,
+                                                 "assist": bool(a),
                                                  "assistX": ax, "assistY": ay}, flip)
                             for x, y, ip, a, ax, ay in rows])
         return routes.value_counts(normalize=True) * 100

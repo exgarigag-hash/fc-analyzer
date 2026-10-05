@@ -38,6 +38,8 @@ create table if not exists match_sides (
   primary key (match_id, ouid)
 );
 create index if not exists match_sides_ouid on match_sides(ouid);
+-- 경기 당시 등급 (넥슨 응답에 있으면 저장 → 가장 정확한 현재 등급)
+alter table match_sides add column if not exists division int;
 
 create table if not exists shots (
   id bigserial primary key,
@@ -151,12 +153,14 @@ from opp
 group by ouid, match_type;
 
 -- division = 비교에 쓰는 등급
+--   0) 경기 기록에 그 경기 당시 등급이 있으면 그 값 (가장 정확)
 --   1) 본인이 최고 등급을 90일 안에 찍었으면 그 등급 (지금 실력과 거의 같음)
 --   2) 아니면 상대 5명 이상 기준 추정 현재 등급
 --   3) 둘 다 없으면 역대 최고 등급
 create or replace view side_summary as
 select ms.match_id, ms.ouid, mp.match_type, mp.patch_id, mp.match_date, mp.collected_at,
-  case when u.max_division_date > now() - interval '90 days' then u.max_division
+  case when ms.division > 0 then ms.division
+       when u.max_division_date > now() - interval '90 days' then u.max_division
        when e.n_opp >= 5 then e.est_division
        else u.max_division end as division,
   ms.gf, ms.ga,
