@@ -97,8 +97,15 @@ def crawl_recent(buffer, share=0.4):
 def crawl(buffer):
     # 앱 검색이나 무작위 수집으로 알게 된 유저도 전부 눈덩이 수집 대상에 넣음
     cur.execute("insert into crawl_queue(ouid) select ouid from users on conflict do nothing")
-    cur.execute("select ouid from crawl_queue where done_at is null "
-                "or done_at < now() - interval '3 days' order by done_at nulls first limit 200")
+    # 등급 다양성: 지금 데이터에 적은 등급의 유저부터 수집 (한 등급에 몰리는 것 방지)
+    cur.execute("""
+      select q.ouid from crawl_queue q
+      left join users u using (ouid)
+      left join (select max_division d, count(*) c from users
+                 where max_division is not null group by 1) t on t.d = u.max_division
+      where q.done_at is null or q.done_at < now() - interval '3 days'
+      order by (u.max_division is null), coalesce(t.c, 0), q.done_at nulls first
+      limit 200""")
     for (ouid,) in cur.fetchall():
         try:
             ids = api.matches(ouid, MTYPE, limit=20)

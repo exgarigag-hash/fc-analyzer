@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+import deep
 from common import (DEFAULT_COEF, HEADER_TYPE, calibrate, db_connect, detect_flip,
                     latest_model, save_match, xg_values)
 
@@ -320,6 +321,9 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
     opp_ouids = tuple(sorted({x.get("ouid") for d in details for x in d.get("matchInfo") or []
                               if x.get("ouid") != ouid}))
     est_div, n_opp = estimate_tier(opp_ouids)
+    recent_max = bool(max_date) and max_date >= (pd.Timestamp.now() - pd.Timedelta(days=90)).strftime("%Y-%m-%d")
+    if recent_max:  # 최근에 최고 등급을 찍었으면 그게 현재 등급에 가장 가까움
+        est_div, n_opp = max_div, -1
     division = est_div or max_div
     details.sort(key=lambda d: d.get("matchDate", ""), reverse=True)
 
@@ -357,7 +361,7 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
 
     me_df, bm_df = pd.DataFrame(me_rows), pd.DataFrame(op_rows)
     ctrl = pd.Series(ctrls).mode().iat[0] if ctrls else None
-    return {"nick": nick, "ouid": ouid, "division": division, "max_div": max_div,
+    return {"details": details, "nick": nick, "ouid": ouid, "division": division, "max_div": max_div,
             "max_date": max_date, "est_div": est_div, "n_opp": n_opp, "me": me_df, "bm": bm_df,
             "me_shots": me_shots, "op_shots": op_shots, "players": pd.DataFrame(players),
             "cmp": compare(me_df, bm_df), "tags": style_tags(me_df, bm_df),
@@ -535,15 +539,22 @@ def tier_population(mtype, division):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def estimate_tier(opp_ouids):
-    """추정 현재 등급 = 최근 상대들의 등급 중앙값 (매칭은 비슷한 실력끼리 잡히니까)."""
+    """추정 현재 등급 = 최근 상대들의 등급 중앙값 (매칭은 비슷한 실력끼리 잡히니까).
+    최고 등급을 90일 안에 찍은 상대가 5명 이상이면 그 상대들만 씀 (예전 시즌 기록 제외)."""
     cur = cursor()
     if cur is None or not opp_ouids:
         return None, 0
     try:
-        cur.execute("select percentile_disc(0.5) within group (order by max_division), count(*) "
-                    "from users where ouid = any(%s) and max_division is not null", (list(opp_ouids),))
-        v, n = cur.fetchone()
-        return (v, n) if n >= 5 else (None, n)
+        cur.execute("""
+          select percentile_disc(0.5) within group (order by max_division)
+                   filter (where max_division_date > now() - interval '90 days'),
+                 count(*) filter (where max_division_date > now() - interval '90 days'),
+                 percentile_disc(0.5) within group (order by max_division), count(*)
+          from users where ouid = any(%s) and max_division is not null""", (list(opp_ouids),))
+        v_recent, n_recent, v_all, n_all = cur.fetchone()
+        if n_recent >= 5:
+            return v_recent, n_recent
+        return (v_all, n_all) if n_all >= 5 else (None, n_all)
     except Exception:
         return None, 0
 
@@ -704,7 +715,9 @@ def render_tier(r):
     names = div_names()
     est, mx = r.get("est_div"), r.get("max_div")
     line = []
-    if est:
+    if est and r.get("n_opp") == -1:
+        line.append(f"현재 등급 **{names.get(est, est)}** (최근 90일 안에 달성한 최고 등급)")
+    elif est:
         line.append(f"추정 현재 등급 **{names.get(est, est)}** (최근 상대 {r['n_opp']}명의 등급 기준)")
     if mx:
         line.append(f"역대 최고 등급 **{names.get(mx, mx)}**" + (f" ({r['max_date']} 달성)" if r.get("max_date") else ""))
@@ -1027,6 +1040,146 @@ def render_full(r, mode):
                      hide_index=True, width="stretch")
 
 
+
+# ================================================================ 심층 분석 화면
+@st.cache_data(ttl=3600, show_spinner=False)
+def pop_flow():
+    """DB에 쌓인 전체 공식경기로 계산한 경기 흐름 평균."""
+    cur = cursor()
+    if cur is None:
+        return None
+    try:
+        cur.execute("select s.match_id, s.ouid, s.goal_time from shots s join matches m using (match_id) "
+                    "where s.result = 3 and m.match_type = %s", (st.session_state.mtype,))
+        goals = pd.DataFrame(cur.fetchall(), columns=["match_id", "ouid", "goal_time"])
+        cur.execute("select ms.match_id, ms.ouid, ms.result from match_sides ms join matches m using (match_id) "
+                    "where m.match_type = %s", (st.session_state.mtype,))
+        sides = pd.DataFrame(cur.fetchall(), columns=["match_id", "ouid", "result"])
+        if len(sides) < 400:
+            return None
+        res = deep.population_flows(goals, sides)
+        res["_matches"] = len(sides) // 2
+        return res
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def pop_route_share(flip):
+    """DB 전체 슈팅의 루트별 비중 (어시스트 위치가 저장된 슈팅만)."""
+    cur = cursor()
+    if cur is None:
+        return None
+    try:
+        cur.execute("select x, y, in_penalty, assisted, assist_x, assist_y from shots "
+                    "where assisted is not null")
+        rows = cur.fetchall()
+        if len(rows) < 2000:
+            return None
+        routes = pd.Series([deep.classify_route({"x": x, "y": y, "inPenalty": ip, "assist": a,
+                                                 "assistX": ax, "assistY": ay}, flip)
+                            for x, y, ip, a, ax, ay in rows])
+        return routes.value_counts(normalize=True) * 100
+    except Exception:
+        return None
+
+
+def render_deep(r, mode="self"):
+    me, n = r["me"], len(r["me"])
+    coef, flip, n_model = load_model()
+    shots_all = r["me_shots"] + r["op_shots"]
+    if flip is None:
+        flip = detect_flip(shots_all)
+    if not n_model:
+        coef = calibrate(DEFAULT_COEF, shots_all, flip)
+    who = "" if mode == "self" else f"{r['nick']}의 "
+
+    # ---- 1. 루트
+    st.subheader(f"① {who}공격·실점 루트")
+    st.caption("슈팅 위치와 어시스트 위치로 찬스가 어떤 길로 만들어졌는지 분류했어요. "
+               "측면 크로스 / 컷백(골라인 근처에서 뒤로 내준 패스) / 침투 패스 / 박스 근처 연계 / "
+               "개인 돌파·세컨볼(어시스트 없음) / 중거리(박스 밖)")
+    att = deep.route_table(r["me_shots"], coef, flip, n)
+    dfd = deep.route_table(r["op_shots"], coef, flip, n)
+    pop = pop_route_share(flip)
+    for t in deep.route_insights(att, dfd, pop):
+        st.markdown("- " + t)
+    if len(att) and len(dfd):
+        chart = pd.DataFrame({"공격 xG (경기당)": att["경기당 xG"].values,
+                              "허용 xG (경기당)": dfd["경기당 xG"].values}, index=att["루트"].values)
+        st.bar_chart(chart, color=["#1f8a5b", "#d0463b"], horizontal=True, stack=False)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**공격 루트**")
+            st.dataframe(att.round(2), hide_index=True, width="stretch")
+        with c2:
+            st.markdown("**실점 루트**")
+            show = dfd.copy()
+            if pop is not None:
+                show.insert(2, "전체 평균 비중(%)", pop.reindex(show.index).fillna(0).values)
+            st.dataframe(show.round(2), hide_index=True, width="stretch")
+    if pop is None:
+        st.caption("어시스트 위치가 저장된 슈팅이 2,000개 이상 쌓이면 실점 루트에 '전체 평균 비중'도 같이 보여줘요.")
+
+    # ---- 2. 흐름
+    st.subheader(f"② {who}경기 흐름")
+    mine = deep.flow_summary(deep.flows_from_details(r["details"], r["ouid"]))
+    popf = pop_flow()
+    if not mine:
+        st.write("흐름을 계산할 경기가 없어요.")
+    else:
+        rows, flags = [], []
+        cnt = mine["_n"]
+        need = {"선제골 넣었을 때 승률(%)": cnt["first"], "먼저 실점했을 때 승점 획득률(%)": cnt["behind"],
+                "앞서다가 못 이긴 비율(%)": cnt["led"]}
+        for k, better in deep.FLOW_BETTER.items():
+            v = mine.get(k)
+            b = popf.get(k) if popf else np.nan
+            base_n = need.get(k, cnt["all"])
+            judge = "-"
+            if popf and not pd.isna(v) and not pd.isna(b) and base_n >= 8:
+                gap = v - b
+                big = abs(gap) >= (10 if "%" in k else 0.15)
+                if big:
+                    good = (gap > 0) == better
+                    judge = "강점" if good else "약점"
+                    if not good:
+                        flags.append((abs(gap), k))
+            rows.append({"지표": k, "대상": None if pd.isna(v) else round(v, 1),
+                         "전체 평균": None if pd.isna(b) else round(b, 1),
+                         "해당 경기 수": base_n, "판정": judge if base_n >= 8 else "경기 부족"})
+        for _, k in sorted(flags, reverse=True)[:2]:
+            st.markdown(f"- **{k}** 약점: {deep.FLOW_TIP[k]}" if mode == "self"
+                        else f"- **{k}** 약점이 있는 상대예요.")
+        if popf is None:
+            st.caption("DB에 공식경기가 200경기 이상 쌓이면 전체 평균과 비교해서 강점·약점을 판정해요.")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if popf:
+            st.caption(f"전체 평균: DB에 쌓인 공식경기 {popf['_matches']:,}경기 기준. "
+                       "차이가 10%p(경기당 수치는 0.15골) 이상이고 해당 경기가 8경기 이상일 때만 판정해요.")
+
+    # ---- 3. 조합 패턴
+    st.subheader(f"③ {who}승패를 가르는 조합 패턴")
+    rules, n_all = deep.find_rules(me)
+    if n_all < 30:
+        st.write(f"이 분석은 30경기 이상 필요해요 (지금 {n_all}경기). 사이드바에서 분석 경기 수를 늘려 주세요.")
+    elif not rules:
+        st.write("승률을 뚜렷하게 바꾸는 조건 조합을 찾지 못했어요. 경기 수를 늘리면 나타날 수 있어요.")
+    else:
+        lose = [x for x in rules if x["z"] < 0]
+        win = [x for x in rules if x["z"] > 0]
+        if lose:
+            st.markdown("**이럴 때 진다**")
+            for x in lose:
+                st.markdown(f"- {x['조건']} → 승률 **{x['승률']:.0f}%** ({x['경기 수']}경기, 평소 {x['전체 승률']:.0f}%)")
+        if win:
+            st.markdown("**이럴 때 이긴다**")
+            for x in win:
+                st.markdown(f"- {x['조건']} → 승률 **{x['승률']:.0f}%** ({x['경기 수']}경기, 평소 {x['전체 승률']:.0f}%)")
+        st.caption("여러 조건을 한꺼번에 시험해서 찾은 '후보 패턴'이에요. 우연히 맞아떨어진 것도 섞일 수 있으니, "
+                   "경기 수를 늘려도 계속 나오는 패턴을 믿으세요.")
+
+
 # ================================================================ 화면
 st.title("FC 전력분석실")
 
@@ -1072,7 +1225,7 @@ def run_with_status(nick, n, title):
     return r
 
 
-tab_scout, tab_me = st.tabs(["상대 스카우팅", "내 분석"])
+tab_scout, tab_me, tab_deep = st.tabs(["상대 스카우팅", "내 분석", "심층 분석"])
 
 with tab_scout:
     c1, c2 = st.columns([2, 1])
@@ -1121,6 +1274,20 @@ with tab_me:
     res = st.session_state.get("me_result")  # 다른 버튼을 눌러도 결과 유지
     if res is not None:
         st.error(res) if isinstance(res, str) else render_full(res, "self")
+
+with tab_deep:
+    st.caption("공격·실점 루트, 경기 흐름, 승패를 가르는 조합 패턴을 분석해요. 조합 패턴은 경기가 많을수록 정확해서 50경기 이상을 추천해요.")
+    dn = st.text_input("닉네임", key="deep_nick", value=st.session_state.get("saved_me", ""))
+    dgames = st.select_slider("분석 경기 수", [30, 50, 80, 100], value=50, key="deep_n")
+    st.caption("처음 조회하는 경기는 넥슨 하루 호출 한도(1,000건)를 써요. 100경기면 약 100건이에요.")
+    if st.button("심층 분석", key="deep_btn", type="primary") and dn:
+        st.session_state.deep_result = run_with_status(dn, dgames, "심층 분석")
+    dres = st.session_state.get("deep_result")
+    if dres is not None:
+        if isinstance(dres, str):
+            st.error(dres)
+        else:
+            render_deep(dres, "other" if st.session_state.get("saved_me") and dres["nick"] != st.session_state.get("saved_me") else "self")
 
 st.divider()
 st.caption("Data based on NEXON Open API")

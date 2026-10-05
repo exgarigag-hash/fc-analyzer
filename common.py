@@ -120,6 +120,13 @@ def valid_match(d):
                                   for x in info)
 
 
+def goal_minute(gt):
+    """goalTime → 경기 분. 상위 비트는 전·후반/연장 구분, 하위 비트는 해당 구간 경과 초."""
+    period, sec = gt >> 24, (gt & 0xFFFFFF) / 60
+    base = {0: 0, 1: 45, 2: 90, 3: 105}.get(period, 120)
+    return sec if sec >= base else base + sec
+
+
 # ================================================================ xG (기대 득점)
 PITCH_L, PITCH_W, GOAL_W = 105.0, 68.0, 7.32
 HEADER_TYPE = 3  # shootDetail.type 중 헤딩 코드 (넥슨 문서 기준, 다르면 여기만 수정)
@@ -224,10 +231,12 @@ def save_match(cur, d, flip):
             dist, ang, head = shot_features(s, flip)
             shot_rows.append((d["matchId"], side.get("ouid"), s.get("x"), s.get("y"),
                               s.get("type"), s.get("result"), bool(s.get("inPenalty")),
-                              s.get("goalTime"), dist, ang, head))
+                              s.get("goalTime"), dist, ang, head, bool(s.get("assist")),
+                              s.get("assistX"), s.get("assistY")))
     if shot_rows:
         cur.executemany("insert into shots(match_id,ouid,x,y,type,result,in_penalty,goal_time,"
-                        "dist,angle,header) values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", shot_rows)
+                        "dist,angle,header,assisted,assist_x,assist_y) "
+                        "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", shot_rows)
     cur.executemany("insert into users(ouid, nickname) values (%s,%s) "
                     "on conflict (ouid) do update set nickname = excluded.nickname",
                     [(r["ouid"], r["nickname"]) for r in rows])

@@ -47,6 +47,10 @@ create table if not exists shots (
   dist real, angle real, header int
 );
 create index if not exists shots_match on shots(match_id);
+-- 어시스트 위치 (공격·실점 루트 분석용)
+alter table shots add column if not exists assisted boolean;
+alter table shots add column if not exists assist_x real;
+alter table shots add column if not exists assist_y real;
 
 create table if not exists crawl_queue (
   ouid text primary key,
@@ -100,22 +104,36 @@ select s.match_id, s.ouid, s.in_penalty, s.result,
 from shots s
 cross join (select coef from xg_models order by id desc limit 1) c;
 
--- 추정 현재 등급: 매칭은 비슷한 실력끼리 잡히므로, 최근 상대들의 등급 중앙값으로 추정
+-- 추정 현재 등급: 매칭은 비슷한 실력끼리 잡히므로, 최근 상대들의 등급 중앙값으로 추정.
+-- 최고 등급을 90일 안에 찍은 상대(= 지금 실력과 가까운 상대)가 5명 이상이면 그 상대들만 사용.
 create or replace view user_est_division as
-select ms.ouid, m.match_type,
-  percentile_disc(0.5) within group (order by u2.max_division) as est_division,
+with opp as (
+  select ms.ouid, m.match_type, u2.max_division as d,
+         coalesce(u2.max_division_date > now() - interval '90 days', false) as recent
+  from match_sides ms
+  join matches m using (match_id)
+  join match_sides o on o.match_id = ms.match_id and o.ouid <> ms.ouid
+  join users u2 on u2.ouid = o.ouid
+  where u2.max_division is not null
+)
+select ouid, match_type,
+  coalesce(
+    case when count(*) filter (where recent) >= 5
+         then percentile_disc(0.5) within group (order by d) filter (where recent) end,
+    percentile_disc(0.5) within group (order by d)) as est_division,
   count(*) as n_opp
-from match_sides ms
-join matches m using (match_id)
-join match_sides o on o.match_id = ms.match_id and o.ouid <> ms.ouid
-join users u2 on u2.ouid = o.ouid
-where u2.max_division is not null
-group by ms.ouid, m.match_type;
+from opp
+group by ouid, match_type;
 
--- division = 비교에 쓰는 등급 (상대 5명 이상이면 추정 현재 등급, 아니면 역대 최고 등급)
+-- division = 비교에 쓰는 등급
+--   1) 본인이 최고 등급을 90일 안에 찍었으면 그 등급 (지금 실력과 거의 같음)
+--   2) 아니면 상대 5명 이상 기준 추정 현재 등급
+--   3) 둘 다 없으면 역대 최고 등급
 create or replace view side_summary as
 select ms.match_id, ms.ouid, mp.match_type, mp.patch_id, mp.match_date, mp.collected_at,
-  case when e.n_opp >= 5 then e.est_division else u.max_division end as division,
+  case when u.max_division_date > now() - interval '90 days' then u.max_division
+       when e.n_opp >= 5 then e.est_division
+       else u.max_division end as division,
   ms.gf, ms.ga,
   coalesce((select sum(x.xg) from shot_xg x where x.match_id = ms.match_id and x.ouid = ms.ouid), 0) as xg,
   coalesce((select sum(x.xg) from shot_xg x where x.match_id = ms.match_id and x.ouid <> ms.ouid), 0) as xga,
