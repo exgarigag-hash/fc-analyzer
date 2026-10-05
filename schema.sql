@@ -52,6 +52,21 @@ alter table shots add column if not exists assisted boolean;
 alter table shots add column if not exists assist_x real;
 alter table shots add column if not exists assist_y real;
 
+-- 선수별 기록 (선수 기여 분석, 랭커 비교, 팀 변경 비교용)
+create table if not exists player_stats (
+  match_id text references matches on delete cascade,
+  ouid text,
+  sp_id bigint, sp_position int, sp_grade int,
+  shoot int, effective_shoot int, goal int, assist int,
+  pass_try int, pass_success int, dribble_try int, dribble_success int, dribble real,
+  ball_possesion_try int, ball_possesion_success int, aerial_try int, aerial_success int,
+  tackle_try int, tackle int, block_try int, block int, intercept int, defending int,
+  yellow_cards int, red_cards int, sp_rating real,
+  primary key (match_id, ouid, sp_id)
+);
+create index if not exists player_stats_sp on player_stats(sp_id);
+create index if not exists player_stats_ouid on player_stats(ouid);
+
 create table if not exists crawl_queue (
   ouid text primary key,
   added_at timestamptz default now(),

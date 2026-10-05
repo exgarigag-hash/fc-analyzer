@@ -205,6 +205,28 @@ SIDE_COLS = ["ouid", "nickname", "result", "gf", "ga", "shots", "sot", "shots_bo
              "offside", "rating", "controller"]
 
 
+# 넥슨 선수 기록 키 → DB 열 이름
+PLAYER_FIELDS = {
+    "shoot": "shoot", "effectiveShoot": "effective_shoot", "goal": "goal", "assist": "assist",
+    "passTry": "pass_try", "passSuccess": "pass_success", "dribbleTry": "dribble_try",
+    "dribbleSuccess": "dribble_success", "dribble": "dribble",
+    "ballPossesionTry": "ball_possesion_try", "ballPossesionSuccess": "ball_possesion_success",
+    "aerialTry": "aerial_try", "aerialSuccess": "aerial_success", "tackleTry": "tackle_try",
+    "tackle": "tackle", "blockTry": "block_try", "block": "block", "intercept": "intercept",
+    "defending": "defending", "yellowCards": "yellow_cards", "redCards": "red_cards",
+    "spRating": "sp_rating",
+}
+
+
+def player_rows(match_id, side):
+    rows = []
+    for p in side.get("player") or []:
+        st = p.get("status") or {}
+        rows.append((match_id, side.get("ouid"), p.get("spId"), p.get("spPosition"), p.get("spGrade"),
+                     *[st.get(k) for k in PLAYER_FIELDS]))
+    return rows
+
+
 def latest_model(cur):
     cur.execute("select coef, flip, n_shots from xg_models order by id desc limit 1")
     row = cur.fetchone()
@@ -237,6 +259,11 @@ def save_match(cur, d, flip):
         cur.executemany("insert into shots(match_id,ouid,x,y,type,result,in_penalty,goal_time,"
                         "dist,angle,header,assisted,assist_x,assist_y) "
                         "values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", shot_rows)
+    prow = player_rows(d["matchId"], info[0]) + player_rows(d["matchId"], info[1])
+    if prow:
+        cols = ["match_id", "ouid", "sp_id", "sp_position", "sp_grade", *PLAYER_FIELDS.values()]
+        cur.executemany(f"insert into player_stats({','.join(cols)}) values ({','.join(['%s'] * len(cols))}) "
+                        "on conflict do nothing", prow)
     cur.executemany("insert into users(ouid, nickname) values (%s,%s) "
                     "on conflict (ouid) do update set nickname = excluded.nickname",
                     [(r["ouid"], r["nickname"]) for r in rows])

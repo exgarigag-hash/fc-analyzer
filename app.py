@@ -337,7 +337,7 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
             return (f"오늘 넥슨 API 한도를 다 썼고, DB에 '{nick}'의 경기가 {len(ids)}개뿐이라 분석이 어려워요. "
                     "한도가 초기화된 뒤 다시 시도하세요.")
         st.info(f"오늘 넥슨 API 한도를 다 써서, DB에 저장된 '{nick}'의 경기 {len(ids)}개로 분석했어요. "
-                "최신 경기가 빠져 있을 수 있고 선수별 기록은 비어 있을 수 있어요.")
+                "최신 경기가 빠져 있을 수 있고, 예전에 저장된 경기는 선수별 기록이 비어 있을 수 있어요.")
     details = fetch_details(ids, key, label)
     db_save(details, ouid)
     try:
@@ -638,11 +638,23 @@ def details_from_db(match_ids):
             shots.setdefault((mid, o), []).append(
                 {"x": x, "y": y, "type": t, "result": res, "inPenalty": ip, "goalTime": gt or 0,
                  "assist": a, "assistX": ax, "assistY": ay})
+        players = {}
+        try:
+            from common import PLAYER_FIELDS
+            cols = ["match_id", "ouid", "sp_id", "sp_position", "sp_grade", *PLAYER_FIELDS.values()]
+            cur.execute(f"select {','.join(cols)} from player_stats where match_id = any(%s)", (list(ms),))
+            for r in cur.fetchall():
+                stt = dict(zip(PLAYER_FIELDS.keys(), r[5:]))
+                players.setdefault((r[0], r[1]), []).append(
+                    {"spId": r[2], "spPosition": r[3], "spGrade": r[4], "status": stt})
+        except Exception:
+            players = {}
         out = {}
         for mid, mt, md in ms.values():
             info = []
             for sd in (x for x in sides if x["match_id"] == mid):
-                side = {"ouid": sd["ouid"], "nickname": sd["nickname"], "player": [],
+                side = {"ouid": sd["ouid"], "nickname": sd["nickname"],
+                        "player": players.get((mid, sd["ouid"]), []),
                         "shootDetail": shots.get((mid, sd["ouid"]), [])}
                 for part, mp in SIDE_MAP.items():
                     side[part] = {k: sd.get(v) for k, v in mp.items()}
