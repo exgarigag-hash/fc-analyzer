@@ -188,15 +188,16 @@ def diagnostics():
         cur.execute(f"select count(*) from {t}")
         log(f"현재 {t}:", cur.fetchone()[0])
     if not seeds:
-        log("참고: SEED_NICKNAMES 없이 전체 최근 경기부터 수집해요.")
+        log("참고: SEED_NICKNAMES 없이 이미 모인 유저들로 이어서 수집해요.")
 
 
 buffer = {}
 diagnostics()
 try:
     register_seeds()
-    crawl_recent(buffer)                               # 1) 검색 없이 무작위 수집
-    save(buffer)                                       #    → 저장해야 2), 3)에서 이 유저들을 씀
+    if os.environ.get("TRY_RECENT") == "1":            # 1) 전체 최근 경기 (넥슨이 막아둬서 기본은 끔)
+        crawl_recent(buffer)
+        save(buffer)
     refresh_users(limit=max(20, api.max_calls // 4))   # 2) 등급 정보 (예산 약 25%)
     crawl(buffer)                                      # 3) 남은 예산으로 눈덩이 수집
 except BudgetExceeded:
