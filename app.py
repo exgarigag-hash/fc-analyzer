@@ -640,7 +640,9 @@ def details_from_db(match_ids):
         for mid, o, x, y, t, res, ip, gt, a, ax, ay in cur.fetchall():
             shots.setdefault((mid, o), []).append(
                 {"x": x, "y": y, "type": t, "result": res, "inPenalty": ip, "goalTime": gt or 0,
-                 "assist": a, "assistX": ax, "assistY": ay})
+                 # 어시스트 좌표가 저장된 슈팅만 판단 가능 (예전 행은 assisted가 기본값 False라 믿지 않음)
+                 "assist": None if ax is None else bool(a) or (ax or 0) > 0 or (ay or 0) > 0,
+                 "assistX": ax, "assistY": ay})
         players = {}
         try:
             from common import PLAYER_FIELDS
@@ -1210,11 +1212,12 @@ def pop_route_share(flip):
         return None
     try:
         cur.execute("select x, y, in_penalty, assisted, assist_x, assist_y from shots "
-                    "where assisted is not null")
+                    "where assist_x is not null")
         rows = cur.fetchall()
         if len(rows) < 2000:
             return None
-        routes = pd.Series([deep.classify_route({"x": x, "y": y, "inPenalty": ip, "assist": a,
+        routes = pd.Series([deep.classify_route({"x": x, "y": y, "inPenalty": ip,
+                                                 "assist": bool(a) or (ax or 0) > 0 or (ay or 0) > 0,
                                                  "assistX": ax, "assistY": ay}, flip)
                             for x, y, ip, a, ax, ay in rows])
         return routes.value_counts(normalize=True) * 100
@@ -1238,8 +1241,15 @@ def render_deep(r, mode="self"):
                "측면 크로스 / 컷백(골라인 근처에서 뒤로 내준 패스) / 침투 패스 / 박스 근처 연계 / "
                "개인 돌파·세컨볼(어시스트 없음) / 중거리(박스 밖)")
     att = deep.route_table(r["me_shots"], coef, flip, n)
+    cov = getattr(deep.route_table, "coverage", 1.0)
     dfd = deep.route_table(r["op_shots"], coef, flip, n)
     pop = pop_route_share(flip)
+    if cov < 0.95:
+        st.info(f"슈팅 중 {cov * 100:.0f}%만 어시스트 정보가 있어서 그 슈팅들로만 루트를 분류했어요. "
+                "어시스트 정보 저장을 시작하기 전에 모인 경기가 섞여 있어서 그래요. 새 경기가 쌓일수록 정확해져요.")
+    if att.empty:
+        st.write("어시스트 정보가 있는 슈팅이 아직 적어서 루트를 분류할 수 없어요. "
+                 "한도가 남아 있을 때 분석하면 넥슨에서 새로 받아온 경기로 분류해요.")
     for t in deep.route_insights(att, dfd, pop):
         st.markdown("- " + t)
     if len(att) and len(dfd):

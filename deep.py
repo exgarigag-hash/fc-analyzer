@@ -6,7 +6,7 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 
-from common import goal_minute, xg_values
+from common import goal_minute, has_assist, xg_values
 
 # ================================================================ 1. 공격·실점 루트
 ROUTES = {
@@ -26,7 +26,10 @@ def classify_route(s, flip=False):
     inbox = bool(s.get("inPenalty")) or (x >= 0.843 and 0.204 <= y <= 0.796)
     if not inbox:
         return "long"
-    if not s.get("assist") or s.get("assistX") is None:
+    assisted = has_assist(s)
+    if assisted is None:                     # 어시스트 정보가 없는 슈팅 → 분류 불가
+        return "unknown"
+    if not assisted or s.get("assistX") is None:
         return "solo"
     ax, ay = _xy(s.get("assistX"), s.get("assistY"), flip)
     if ax >= 0.88 and ax > x + 0.01:          # 골라인 근처에서 뒤로 내준 패스
@@ -45,6 +48,12 @@ def route_table(shots, coef, flip, n_matches):
     xs = xg_values(shots, coef, flip)
     df = pd.DataFrame({"route": [classify_route(s, flip) for s in shots], "xg": xs,
                        "goal": [s.get("result") == 3 for s in shots]})
+    known = df.route != "unknown"
+    route_table.coverage = float(known.mean()) if len(df) else 0.0  # 분류 가능한 슈팅 비율
+    if known.sum() < 20:
+        return pd.DataFrame()
+    df = df[known]
+    n_matches = n_matches * route_table.coverage  # 분류 가능한 슈팅이 나온 경기 수로 환산
     g = df.groupby("route").agg(shots=("xg", "size"), xg=("xg", "sum"), goals=("goal", "sum"))
     g = g.reindex(list(ROUTES), fill_value=0)
     out = pd.DataFrame({

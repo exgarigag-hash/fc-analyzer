@@ -133,6 +133,21 @@ HEADER_TYPE = 3  # shootDetail.type 중 헤딩 코드 (넥슨 문서 기준, 다
 DEFAULT_COEF = {"b0": -0.5, "dist": -0.11, "angle": 1.3, "header": -0.8}
 
 
+def has_assist(s):
+    """어시스트가 있었던 슈팅인지. 넥슨 응답에 'assist' 값이 없고 assistSpId·assistX만 오는 경우가 있어서
+    여러 단서를 같이 봄. 판단할 단서가 하나도 없으면 None(알 수 없음)."""
+    a, sp, ax, ay = s.get("assist"), s.get("assistSpId"), s.get("assistX"), s.get("assistY")
+    if a is None and sp is None and ax is None:
+        return None
+    if a:
+        return True
+    if sp not in (None, 0, -1):
+        return True
+    if ax is not None and ((ax or 0) > 0 or (ay or 0) > 0):
+        return True
+    return False
+
+
 def shot_features(s, flip=False):
     """슈팅 좌표 → (골대까지 거리 m, 골대가 보이는 각도 rad, 헤딩 여부)."""
     x, y = float(s.get("x") or 0), float(s.get("y") or 0)
@@ -253,7 +268,7 @@ def save_match(cur, d, flip):
             dist, ang, head = shot_features(s, flip)
             shot_rows.append((d["matchId"], side.get("ouid"), s.get("x"), s.get("y"),
                               s.get("type"), s.get("result"), bool(s.get("inPenalty")),
-                              s.get("goalTime"), dist, ang, head, bool(s.get("assist")),
+                              s.get("goalTime"), dist, ang, head, has_assist(s),
                               s.get("assistX"), s.get("assistY")))
     if shot_rows:
         cur.executemany("insert into shots(match_id,ouid,x,y,type,result,in_penalty,goal_time,"
