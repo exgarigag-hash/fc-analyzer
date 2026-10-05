@@ -86,6 +86,16 @@ insert into xg_models(n_shots, coef, flip)
 select 0, '{"b0": -0.5, "dist": -0.11, "angle": 1.3, "header": -0.8}', null
 where not exists (select 1 from xg_models);
 
+-- 복합분석 모델 (매일 밤 GitHub Actions가 학습해서 저장)
+create table if not exists ml_models (
+  id serial primary key,
+  created_at timestamptz default now(),
+  n_sides int,
+  metrics jsonb,
+  baseline jsonb,
+  model text
+);
+
 -- 30일이 지나 지우기 전에 남겨두는 익명 집계 (패치별 추세 분석용, 유저 식별 정보 없음)
 create table if not exists patch_tier_agg (
   patch_id int, match_type int, division int, day date,

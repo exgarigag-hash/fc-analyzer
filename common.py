@@ -268,3 +268,50 @@ def save_match(cur, d, flip):
                     "on conflict (ouid) do update set nickname = excluded.nickname",
                     [(r["ouid"], r["nickname"]) for r in rows])
     return True
+
+
+# ================================================================ 복합분석 모델용 경기 특징
+FEATURE_INFO = {  # 키: (이름, 묶음)
+    "poss": ("점유율", "경기 운영"), "shots": ("슈팅 수", "공격 전개"),
+    "sot_rate": ("유효슈팅 비율", "마무리"), "box_share": ("박스 안 슈팅 비중", "공격 전개"),
+    "head_share": ("헤딩 슈팅 비중", "마무리"), "pass_try": ("패스 시도", "빌드업"),
+    "pass_rate": ("패스 성공률", "빌드업"), "through_try": ("스루패스 시도", "공격 전개"),
+    "through_rate": ("스루패스 성공률", "공격 전개"), "long_share": ("롱패스 비중", "빌드업"),
+    "tackle_try": ("태클 시도", "수비"), "tackle_rate": ("태클 성공률", "수비"),
+    "block_rate": ("블록 성공률", "수비"), "fouls": ("파울", "수비"), "offside": ("오프사이드", "공격 전개"),
+    "opp_shots": ("허용 슈팅", "수비"), "opp_box_share": ("허용 박스 안 슈팅 비중", "수비"),
+    "opp_sot_rate": ("허용 유효슈팅 비율", "수비"), "opp_pass_rate": ("상대 패스 성공률(압박)", "수비"),
+    "opp_through_rate": ("상대 스루패스 성공률", "수비"),
+    "my_div": ("내 등급", "상황"), "opp_div": ("상대 등급", "상황"),
+}
+FEATURES = list(FEATURE_INFO)
+
+
+def _ratio(a, b):
+    a, b = a or 0, b or 0
+    return a / b if b else np.nan
+
+
+def match_features(me, op, my_div=None, opp_div=None):
+    """한 경기의 특징 (me/op는 side_row 또는 DB match_sides 행과 같은 키를 가진 dict).
+    득점·실점·xG 같은 결과 지표는 빼고, 과정 지표만 씀."""
+    g = lambda d, k: d.get(k) or 0
+    return {
+        "poss": me.get("possession"), "shots": g(me, "shots"),
+        "sot_rate": _ratio(me.get("sot"), me.get("shots")),
+        "box_share": _ratio(me.get("shots_box"), me.get("shots")),
+        "head_share": _ratio(me.get("shots_head"), me.get("shots")),
+        "pass_try": g(me, "pass_try"), "pass_rate": _ratio(me.get("pass_succ"), me.get("pass_try")),
+        "through_try": g(me, "through_try"),
+        "through_rate": _ratio(me.get("through_succ"), me.get("through_try")),
+        "long_share": _ratio(me.get("long_try"), me.get("pass_try")),
+        "tackle_try": g(me, "tackle_try"), "tackle_rate": _ratio(me.get("tackle_succ"), me.get("tackle_try")),
+        "block_rate": _ratio(me.get("block_succ"), me.get("block_try")),
+        "fouls": g(me, "fouls"), "offside": g(me, "offside"),
+        "opp_shots": g(op, "shots"), "opp_box_share": _ratio(op.get("shots_box"), op.get("shots")),
+        "opp_sot_rate": _ratio(op.get("sot"), op.get("shots")),
+        "opp_pass_rate": _ratio(op.get("pass_succ"), op.get("pass_try")),
+        "opp_through_rate": _ratio(op.get("through_succ"), op.get("through_try")),
+        "my_div": my_div if my_div is not None else np.nan,
+        "opp_div": opp_div if opp_div is not None else np.nan,
+    }

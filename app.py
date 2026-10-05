@@ -18,6 +18,7 @@ import requests
 import streamlit as st
 
 import deep
+from common import FEATURE_INFO, FEATURES, match_features, side_row
 from common import (DEFAULT_COEF, HEADER_TYPE, calibrate, db_connect, detect_flip,
                     latest_model, save_match, xg_values)
 
@@ -1456,6 +1457,209 @@ def render_players_team(r, key):
     st.caption("두 구간을 경기 단위로 재추출해서 비교했어요 (확실 95%, 가능성 80%). "
                "같은 시기에 패치나 등급 변화가 있었다면 그 효과도 섞여 있을 수 있어요.")
 
+
+# ================================================================ 복합 분석 (계층 모형 + 머신러닝 기여도)
+@st.cache_data(ttl=1800, show_spinner=False)
+def eb_population(mtype, division):
+    """같은 등급 유저들의 경기당 평균·분산·경기 수 (실력 보정용). 30명이 안 되면 등급 범위를 넓힘."""
+    cur = cursor()
+    if cur is None or division is None:
+        return None
+    try:
+        ids = sorted(d["divisionId"] for d in meta("division"))
+        names = {d["divisionId"]: d["divisionName"] for d in meta("division")}
+        if division not in ids:
+            return None
+        i = ids.index(division)
+        for span in (0, 1, 2):
+            near = ids[max(0, i - span): i + span + 1]
+            cur.execute("""
+              select count(*), avg(xg), var_samp(xg), avg(xga), var_samp(xga),
+                     avg(gf - xg), var_samp(gf - xg), avg(ga - xga), var_samp(ga - xga)
+              from side_summary where match_type = %s and division = any(%s)
+              group by ouid having count(*) >= 5""", (mtype, near))
+            rows = np.array(cur.fetchall(), dtype=float)
+            if len(rows) >= 30:
+                return {"rows": rows, "divs": [names.get(d, str(d)) for d in near]}
+    except Exception:
+        return None
+    return None
+
+
+# (키, 이름, 높을수록 좋으면 1, eb_population 결과에서 평균이 있는 열 번호)
+EB_COMPS = [("create", "찬스 창출 (경기당 xG)", 1, 1), ("finish", "결정력 (골 − xG)", 1, 5),
+            ("defend", "수비 조직 (경기당 허용 xG)", -1, 3), ("keeper", "막판 방어 (실점 − 허용 xG)", -1, 7)]
+
+
+def eb_estimate(x, pop, col):
+    """경험적 베이즈: 경기 수가 적을수록 등급 평균 쪽으로 당겨서 '진짜 실력'을 추정."""
+    n_i, m_i, v_i = pop[:, 0], pop[:, col], np.nan_to_num(pop[:, col + 1], nan=0.0)
+    sigma2 = float(np.sum((n_i - 1) * v_i) / max(np.sum(n_i - 1), 1))  # 경기마다 흔들리는 정도
+    mu = float(np.mean(m_i))
+    tau2 = max(float(np.var(m_i, ddof=1) - np.mean(sigma2 / n_i)), 0.02 * float(np.var(m_i, ddof=1)) + 1e-6)
+    n = len(x)
+    prec = n / sigma2 + 1 / tau2
+    post = (n / sigma2 * float(np.mean(x)) + mu / tau2) / prec
+    return {"obs": float(np.mean(x)), "post": post, "sd": prec ** -0.5, "mu": mu,
+            "weight": (n / sigma2) / prec, "n": n}
+
+
+@st.cache_resource(show_spinner=False)
+def load_ml(_version):
+    cur = cursor()
+    if cur is None:
+        return None
+    try:
+        import lightgbm as lgb
+        cur.execute("select id, metrics, baseline, model from ml_models where id = %s", (_version,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "metrics": row[1], "baseline": row[2],
+                "booster": lgb.Booster(model_str=row[3])}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def ml_status():
+    cur = cursor()
+    if cur is None:
+        return None, 0
+    try:
+        cur.execute("select max(id) from ml_models")
+        mid = cur.fetchone()[0]
+        cur.execute("select count(*) from matches where match_type = 50")
+        return mid, cur.fetchone()[0]
+    except Exception:
+        return None, 0
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def user_divisions(ouids):
+    cur = cursor()
+    if cur is None or not ouids:
+        return {}
+    try:
+        cur.execute("select ouid, max_division from users where ouid = any(%s)", (list(ouids),))
+        return dict(cur.fetchall())
+    except Exception:
+        return {}
+
+
+def user_feature_frame(r):
+    """분석 대상의 경기마다 학습 때와 같은 방식으로 특징을 만듦."""
+    opp_ids = tuple(sorted({x.get("ouid") for d in r["details"] for x in d.get("matchInfo") or []
+                            if x.get("ouid") != r["ouid"]}))
+    odiv = user_divisions(opp_ids)
+    rows, meta_rows = [], []
+    for d in r["details"]:
+        info = d.get("matchInfo") or []
+        me = next((x for x in info if x.get("ouid") == r["ouid"]), None)
+        if me is None or len(info) != 2 or (me.get("matchDetail") or {}).get("matchEndType", 0) != 0:
+            continue
+        op = info[1] if info[0] is me else info[0]
+        a, b = side_row(me, op), side_row(op, me)
+        rows.append(match_features(a, b, r.get("division"), odiv.get(op.get("ouid"))))
+        meta_rows.append({"date": d.get("matchDate", "")[:10], "opp": op.get("nickname"),
+                          "score": f"{a['gf']}:{a['ga']}", "result": a["result"]})
+    return pd.DataFrame(rows, columns=FEATURES).astype(float), pd.DataFrame(meta_rows)
+
+
+def render_complex(r):
+    st.caption(f"{r['nick']} · 최근 {len(r['me'])}경기 기준")
+    coef, flip, n_model = load_model()
+    shots_all = r["me_shots"] + r["op_shots"]
+    if flip is None:
+        flip = detect_flip(shots_all)
+    if not n_model:
+        coef = calibrate(DEFAULT_COEF, shots_all, flip)
+    xf, xa = per_match_xg(r, coef, flip)
+    gf, ga = r["me"].gf.values.astype(float), r["me"].ga.values.astype(float)
+    comp = {"create": xf, "finish": gf - xf, "defend": xa, "keeper": ga - xa}
+
+    # ---- 1. 계층 모형
+    st.subheader("① 보정된 실력 (계층 모형)")
+    pop = eb_population(st.session_state.mtype, r.get("division"))
+    if pop is None:
+        st.write("같은 등급 유저가 30명 이상(유저당 5경기 이상) 모여야 보정할 수 있어요. 수집이 진행되면 자동으로 나타나요.")
+    else:
+        rows, notes = [], []
+        for key, name, sign, col in EB_COMPS:
+            e = eb_estimate(comp[key], pop["rows"], col)
+            lo, hi = e["post"] - 1.96 * e["sd"], e["post"] + 1.96 * e["sd"]
+            gap = sign * (e["post"] - e["mu"])
+            if (sign > 0 and lo > e["mu"]) or (sign < 0 and hi < e["mu"]):
+                v = "확실한 강점"
+            elif (sign > 0 and hi < e["mu"]) or (sign < 0 and lo > e["mu"]):
+                v = "확실한 약점"
+            else:
+                v = "강점 쪽" if gap > 0.05 else "약점 쪽" if gap < -0.05 else "등급 평균 수준"
+            rows.append({"항목": name, "관측값": e["obs"], "보정된 실력": e["post"],
+                         "95% 범위": f"{lo:.2f} ~ {hi:.2f}", "등급 평균": e["mu"],
+                         "내 기록 반영 비율": f"{e['weight'] * 100:.0f}%", "판정": v})
+            if key == "finish" and e["weight"] < 0.5:
+                notes.append("결정력은 운의 영향이 커서 내 기록보다 등급 평균 쪽으로 많이 보정됐어요.")
+        st.dataframe(pd.DataFrame(rows).round(2), hide_index=True, width="stretch")
+        st.caption(f"비교 기준: {', '.join(pop['divs'])} 유저 {len(pop['rows'])}명. "
+                   "경기 수가 적거나 경기마다 들쭉날쭉한 항목일수록 등급 평균 쪽으로 당겨서, 운에 덜 흔들리는 실력을 추정해요. "
+                   + " ".join(notes))
+
+    # ---- 2. 머신러닝 기여도
+    st.subheader("② 승률 요인 분해 (머신러닝)")
+    mid, n_matches = ml_status()
+    ml = load_ml(mid) if mid else None
+    if ml is None:
+        st.write(f"복합분석 모델은 공식경기 5,000경기가 모이면 매일 새벽 자동으로 학습돼요 "
+                 f"(지금 {n_matches:,}경기, {min(100, n_matches / 50):.0f}%).")
+        st.progress(min(1.0, n_matches / 5000))
+        return
+    X, info = user_feature_frame(r)
+    if len(X) < 10:
+        st.write("요인 분해는 10경기 이상 필요해요.")
+        return
+    bl = ml["baseline"]
+    base = bl.get(str(r.get("division")), bl["all"])
+    contrib = ml["booster"].predict(X, pred_contrib=True)[:, :-1]
+    user_c = pd.Series(contrib.mean(0), index=FEATURES)
+    diff = user_c - pd.Series(base["contrib"])
+    p0 = base["win"]
+    pp = diff * p0 * (1 - p0) * 100  # 로그 오즈 차이 → 승률 %p (근사)
+    cause = pp.drop(["my_div", "opp_div"])
+    grp = cause.groupby(lambda k: FEATURE_INFO[k][1]).sum().sort_values()
+    m = ml["metrics"]
+    total = cause.sum()
+    st.markdown(f"같은 등급 평균과 비교했을 때, 과정 지표로 설명되는 승률 차이는 **{total:+.1f}%p**예요.")
+    st.bar_chart(grp.rename("승률 영향(%p)"), horizontal=True, color="#3b7dd8")
+    neg, pos = cause.sort_values().head(3), cause.sort_values(ascending=False).head(3)
+    st.markdown("**승률을 깎는 요인**")
+    for k, v in neg.items():
+        if v < -0.3:
+            st.markdown(f"- {FEATURE_INFO[k][0]}: **{v:+.1f}%p** (내 평균 {X[k].mean():.2f})")
+    st.markdown("**승률을 올리는 요인**")
+    for k, v in pos.items():
+        if v > 0.3:
+            st.markdown(f"- {FEATURE_INFO[k][0]}: **{v:+.1f}%p** (내 평균 {X[k].mean():.2f})")
+    ctx = pp[["my_div", "opp_div"]].sum()
+    if abs(ctx) >= 1:
+        st.caption(f"참고: 상대 등급 같은 상황 요인이 승률에 {ctx:+.1f}%p 영향을 줬어요 (실력과 무관한 부분).")
+
+    lost = info.index[info.result == "패"][:8]
+    if len(lost):
+        st.markdown("**최근 진 경기의 주요 원인**")
+        rows = []
+        for i in lost:
+            c = pd.Series(contrib[i], index=FEATURES).drop(["my_div", "opp_div"]) - \
+                pd.Series(base["contrib"]).drop(["my_div", "opp_div"])
+            worst = c.sort_values().head(2)
+            rows.append({"날짜": info.date[i], "상대": info.opp[i], "스코어": info.score[i],
+                         "주요 원인": " / ".join(FEATURE_INFO[k][0] for k in worst.index)})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption(f"모델 정확도: 최근 {m['n_valid']:,}경기로 검증한 결과 AUC {m['auc']:.2f}, "
+               f"승패 적중률 {m['accuracy'] * 100:.0f}% (찍기 기준 {m['base_accuracy'] * 100:.0f}%). "
+               "AUC는 0.5면 찍는 수준, 0.7 이상이면 쓸 만한 수준이에요. "
+               "요인은 상관관계라서 '이걸 고치면 반드시 이긴다'는 뜻은 아니에요.")
+
 # ================================================================ 화면
 st.title("FC 전력분석실")
 
@@ -1501,7 +1705,7 @@ def run_with_status(nick, n, title):
     return r
 
 
-tab_scout, tab_me, tab_deep, tab_pt = st.tabs(["상대 스카우팅", "내 분석", "심층 분석", "선수·팀"])
+tab_scout, tab_me, tab_deep, tab_pt, tab_cx = st.tabs(["상대 스카우팅", "내 분석", "심층 분석", "선수·팀", "복합 분석"])
 
 with tab_scout:
     c1, c2 = st.columns([2, 1])
@@ -1574,6 +1778,16 @@ with tab_pt:
     pres = st.session_state.get("pt_result")
     if pres is not None:
         st.error(pres) if isinstance(pres, str) else render_players_team(pres, api_key)
+
+with tab_cx:
+    st.caption("운에 덜 흔들리는 보정된 실력과, 여러 지표를 함께 본 승률 요인을 보여줘요.")
+    cn = st.text_input("닉네임", key="cx_nick", value=st.session_state.get("saved_me", ""))
+    cgames = st.select_slider("분석 경기 수", [30, 50, 80, 100], value=50, key="cx_n")
+    if st.button("복합 분석", key="cx_btn", type="primary") and cn:
+        st.session_state.cx_result = run_with_status(cn, cgames, "복합 분석")
+    cres = st.session_state.get("cx_result")
+    if cres is not None:
+        st.error(cres) if isinstance(cres, str) else render_complex(cres)
 
 st.divider()
 st.caption("Data based on NEXON Open API")
