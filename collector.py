@@ -85,11 +85,13 @@ def crawl_recent(buffer, share=0.4):
                     buffer[mid] = api.detail(mid)
                 except ApiError:
                     pass
-        offset += 100
-    log("전체 최근 경기에서 가져온 경기:", len(buffer))
+        offset += len(ids)
+    log("전체 최근 경기에서 가져온 경기:", len(buffer), "| 사용한 파라미터:", api._recent_params)
 
 
 def crawl(buffer):
+    # 앱 검색이나 무작위 수집으로 알게 된 유저도 전부 눈덩이 수집 대상에 넣음
+    cur.execute("insert into crawl_queue(ouid) select ouid from users on conflict do nothing")
     cur.execute("select ouid from crawl_queue where done_at is null "
                 "or done_at < now() - interval '3 days' order by done_at nulls first limit 200")
     for (ouid,) in cur.fetchall():

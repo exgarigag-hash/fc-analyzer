@@ -63,10 +63,25 @@ class Nexon:
         return self.get("/fconline/v1/user/match",
                         {"ouid": ouid, "matchtype": mtype, "offset": offset, "limit": limit})
 
+    _recent_params = None  # 넥슨이 받아주는 파라미터 조합 (처음 성공한 걸 기억)
+
     def recent_matches(self, mtype, limit=100, offset=0):
-        """매치 종류별 최근 경기 목록 (특정 유저 없이 전체에서 가져옴)."""
-        return self.get("/fconline/v1/match", {"matchtype": mtype, "offset": offset,
-                                               "limit": limit, "orderby": "desc"})
+        """매치 종류별 최근 경기 목록 (특정 유저 없이 전체에서 가져옴).
+        넥슨 문서와 실제 허용값이 다를 수 있어서 몇 가지 조합을 차례로 시도."""
+        tries = [self._recent_params] if self._recent_params else [
+            {"orderby": "desc", "limit": limit}, {"limit": limit},
+            {"orderby": "desc", "limit": 20}, {"limit": 20}]
+        last = None
+        for extra in tries:
+            try:
+                ids = self.get("/fconline/v1/match", {"matchtype": mtype, "offset": offset, **extra})
+                self._recent_params = extra
+                return ids
+            except ApiError as e:
+                last = e
+                if e.status != 400:
+                    raise
+        raise last
 
     def detail(self, mid):
         return self.get("/fconline/v1/match-detail", {"matchid": mid})
