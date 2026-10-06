@@ -1264,26 +1264,6 @@ def render_deep(r, mode="self"):
     if att.empty:
         st.write("어시스트 정보가 있는 슈팅이 아직 적어서 루트를 분류할 수 없어요. "
                  "한도가 남아 있을 때 분석하면 넥슨에서 새로 받아온 경기로 분류해요.")
-    with st.expander("데이터 확인 (개발용)"):
-        st.write("앱에 저장된 기록이 아니라 넥슨에서 경기 1개를 직접 새로 받아서, 슈팅 기록의 실제 필드 이름을 보여줘요.")
-        if st.button("넥슨 원본 1경기 받아보기 (호출 1건)", key=f"raw_{r['nick']}"):
-            try:
-                mid = r["details"][0]["matchId"]
-                raw = _get("/fconline/v1/match-detail", {"matchid": mid}, st.session_state.api_key)
-                shots = [x for side in raw.get("matchInfo") or [] for x in side.get("shootDetail") or []]
-                keys = sorted({k for x in shots for k in x})
-                st.session_state.raw_check = {"keys": keys, "n": len(shots),
-                                              "samples": [x for x in shots if x.get("inPenalty")][:2] or shots[:2]}
-            except Exception as e:
-                st.session_state.raw_check = {"error": str(e)}
-        rc = st.session_state.get("raw_check")
-        if rc:
-            if "error" in rc:
-                st.error(rc["error"])
-            else:
-                st.write(f"슈팅 {rc['n']}개의 필드 이름: " + ", ".join(rc["keys"]))
-                for x in rc["samples"]:
-                    st.json(x)
     for t in deep.route_insights(att, dfd, pop):
         st.markdown("- " + t)
     if len(att) and len(dfd):
@@ -1425,15 +1405,8 @@ def render_players_team(r, key):
         if limited:
             st.info("오늘 넥슨 API 한도를 다 써서 랭커 기록을 일부만 불러왔어요. 한도가 초기화되면 전부 보여줘요.")
         cmp_df = deep.ranker_compare(mine, rk)
-        with st.expander("랭커 데이터 확인 (개발용)"):
-            st.write(f"요청한 선수 {rdiag['requested']}명 · 랭커 기록을 받은 선수 {len(rk)}명")
-            if rdiag["errors"]:
-                st.write("넥슨 응답 오류:")
-                for e in rdiag["errors"][:3]:
-                    st.code(e)
-            st.write("넥슨 응답 예시 (첫 번째):")
-            st.json(rdiag["sample"] if rdiag["sample"] is not None else "응답 없음")
-            st.write("요청한 선수 예시 (spId, 포지션):", list(keys[:3]))
+        if rdiag["errors"] and not rk:
+            st.warning("넥슨 랭커 기록을 불러오지 못했어요: " + rdiag["errors"][0])
         if cmp_df.empty:
             st.write("랭커 기록이 있는 선수가 없어요. 랭커들이 잘 쓰지 않는 카드이거나, 아직 랭커 기록을 못 불러온 거예요.")
         else:
@@ -1804,7 +1777,10 @@ with tab_scout:
                 st.session_state.scout_full = run_with_status(onick_s, n_games, "상세 분석")
             full = st.session_state.get("scout_full")
             if full is not None:
-                st.error(full) if isinstance(full, str) else render_full(full, "scout")
+                if isinstance(full, str):
+                    st.error(full)
+                else:
+                    render_full(full, "scout")
 
 with tab_me:
     nick = st.text_input("내 닉네임", key="me_nick",
@@ -1814,7 +1790,10 @@ with tab_me:
         st.session_state.me_result = run_with_status(nick, n_games, "내 분석")
     res = st.session_state.get("me_result")  # 다른 버튼을 눌러도 결과 유지
     if res is not None:
-        st.error(res) if isinstance(res, str) else render_full(res, "self")
+        if isinstance(res, str):
+            st.error(res)
+        else:
+            render_full(res, "self")
 
 with tab_deep:
     st.caption("공격·실점 루트, 경기 흐름, 승패를 가르는 조합 패턴을 분석해요. 조합 패턴은 경기가 많을수록 정확해서 50경기 이상을 추천해요.")
@@ -1838,7 +1817,10 @@ with tab_pt:
         st.session_state.pt_result = run_with_status(pn, pgames, "선수·팀 분석")
     pres = st.session_state.get("pt_result")
     if pres is not None:
-        st.error(pres) if isinstance(pres, str) else render_players_team(pres, api_key)
+        if isinstance(pres, str):
+            st.error(pres)
+        else:
+            render_players_team(pres, api_key)
 
 with tab_cx:
     st.caption("운에 덜 흔들리는 보정된 실력과, 여러 지표를 함께 본 승률 요인을 보여줘요.")
@@ -1848,7 +1830,10 @@ with tab_cx:
         st.session_state.cx_result = run_with_status(cn, cgames, "복합 분석")
     cres = st.session_state.get("cx_result")
     if cres is not None:
-        st.error(cres) if isinstance(cres, str) else render_complex(cres)
+        if isinstance(cres, str):
+            st.error(cres)
+        else:
+            render_complex(cres)
 
 st.divider()
 st.caption("Data based on NEXON Open API")
