@@ -1366,21 +1366,29 @@ def render_deep(r, mode="self"):
 # ================================================================ 선수·팀 화면 (랭커 비교 / 팀 변경 비교)
 @st.cache_data(ttl=43200, show_spinner=False)
 def ranker_stats(mtype, players, key):
-    """TOP 1만 랭커들이 같은 선수(카드+포지션)를 썼을 때의 평균 기록 (넥슨 ranker-stats)."""
-    out, limited = {}, False
+    """TOP 1만 랭커들이 같은 선수(카드+포지션)를 썼을 때의 평균 기록 (넥슨 ranker-stats).
+    반환: (기록 dict, 한도 초과 여부, 진단 정보)"""
+    out, limited, diag = {}, False, {"errors": [], "sample": None, "requested": len(players)}
     for i in range(0, len(players), 10):
         chunk = [{"id": int(sp), "po": int(po)} for sp, po in players[i:i + 10]]
         try:
             res = _get("/fconline/v1/ranker-stats",
-                       {"matchtype": mtype, "players": json.dumps(chunk)}, key)
+                       {"matchtype": mtype, "players": json.dumps(chunk, separators=(",", ":"))}, key)
         except ApiError as e:
             if e.status == 429:
                 limited = True
                 break
+            diag["errors"].append(str(e)[:200])
             continue
-        for row in res or []:
-            out[(int(row.get("spId", 0)), int(row.get("spPosition", -1)))] = deep.ranker_row(row.get("status"))
-    return out, limited
+        if diag["sample"] is None:
+            diag["sample"] = (res[:1] if isinstance(res, list) else res)
+        for row in (res if isinstance(res, list) else []):
+            sp = row.get("spId", row.get("spid"))
+            po = row.get("spPosition", row.get("po", row.get("spposition")))
+            if sp is None or po is None:
+                continue
+            out[(int(sp), int(po))] = deep.ranker_row(row.get("status"))
+    return out, limited, diag
 
 
 def sp_names():
@@ -1413,10 +1421,19 @@ def render_players_team(r, key):
         st.write("5경기 이상 뛴 선수가 없어요. 분석 경기 수를 늘려 보세요.")
     else:
         keys = tuple((int(sp), int(row.pos)) for sp, row in mine.iterrows())
-        rk, limited = ranker_stats(st.session_state.mtype, keys, key)
+        rk, limited, rdiag = ranker_stats(st.session_state.mtype, keys, key)
         if limited:
             st.info("오늘 넥슨 API 한도를 다 써서 랭커 기록을 일부만 불러왔어요. 한도가 초기화되면 전부 보여줘요.")
         cmp_df = deep.ranker_compare(mine, rk)
+        with st.expander("랭커 데이터 확인 (개발용)"):
+            st.write(f"요청한 선수 {rdiag['requested']}명 · 랭커 기록을 받은 선수 {len(rk)}명")
+            if rdiag["errors"]:
+                st.write("넥슨 응답 오류:")
+                for e in rdiag["errors"][:3]:
+                    st.code(e)
+            st.write("넥슨 응답 예시 (첫 번째):")
+            st.json(rdiag["sample"] if rdiag["sample"] is not None else "응답 없음")
+            st.write("요청한 선수 예시 (spId, 포지션):", list(keys[:3]))
         if cmp_df.empty:
             st.write("랭커 기록이 있는 선수가 없어요. 랭커들이 잘 쓰지 않는 카드이거나, 아직 랭커 기록을 못 불러온 거예요.")
         else:
