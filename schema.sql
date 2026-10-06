@@ -107,6 +107,8 @@ create table if not exists patch_tier_agg (
 
 -- 등급 기록: 경기 종류별 역대 최고 등급과 달성일 (갱신할 때마다 쌓임)
 alter table users add column if not exists max_division_date timestamptz;
+-- 마지막으로 공식경기를 한 시각 (최근에 활동하는 유저부터 수집하기 위해)
+alter table users add column if not exists last_match_at timestamptz;
 create table if not exists user_divisions (
   ouid text references users on delete cascade,
   match_type int,
@@ -130,6 +132,14 @@ select s.match_id, s.ouid, s.in_penalty, s.result,
                + (c.coef->>'angle')::float8 * s.angle + (c.coef->>'header')::float8 * s.header))) as xg
 from shots s
 cross join (select coef from xg_models order by id desc limit 1) c;
+
+-- 실제 현재 등급: 경기 기록에 남은 '경기 당시 등급' 중 가장 최근 값 (넥슨이 채워준 경기만)
+create or replace view user_cur_division as
+select distinct on (ms.ouid, m.match_type)
+  ms.ouid, m.match_type, ms.division as cur_division, m.match_date as seen_at
+from match_sides ms join matches m using (match_id)
+where ms.division > 0
+order by ms.ouid, m.match_type, m.match_date desc;
 
 -- 추정 현재 등급: 매칭은 비슷한 실력끼리 잡히므로, 최근 상대들의 등급 중앙값으로 추정.
 -- 최고 등급을 90일 안에 찍은 상대(= 지금 실력과 가까운 상대)가 5명 이상이면 그 상대들만 사용.
@@ -204,4 +214,7 @@ alter table crawl_queue enable row level security;
 alter table xg_models enable row level security;
 alter table patch_tier_agg enable row level security;
 alter table user_divisions enable row level security;
-revoke all on match_patch, shot_xg, user_est_division, side_summary, tier_metrics from anon, authenticated;
+alter table player_stats enable row level security;
+alter table ml_models enable row level security;
+revoke all on match_patch, shot_xg, user_est_division, user_cur_division, side_summary, tier_metrics
+  from anon, authenticated;

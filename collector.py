@@ -5,6 +5,7 @@
 환경변수: NEXON_API_KEY, DATABASE_URL, SEED_NICKNAMES(쉼표 구분), MAX_CALLS, CALL_INTERVAL, MATCH_TYPE
 """
 import json
+from datetime import datetime, timedelta, timezone
 import os
 
 import numpy as np
@@ -19,6 +20,7 @@ api = Nexon(os.environ["NEXON_API_KEY"],
 conn = db_connect(os.environ["DATABASE_URL"])
 cur = conn.cursor()
 QUEUE_CAP = 20000
+FRESH_DAYS = int(os.environ.get("FRESH_DAYS") or 14)  # 이보다 오래된 경기는 수집 안 함 (최근 동향 위주)
 
 
 def log(*a):
@@ -94,18 +96,31 @@ def crawl_recent(buffer, share=0.4):
     log("전체 최근 경기에서 가져온 경기:", len(buffer), "| 사용한 파라미터:", api._recent_params)
 
 
+stale_stop = [0]
+
+
 def crawl(buffer):
     # 앱 검색이나 무작위 수집으로 알게 된 유저도 전부 눈덩이 수집 대상에 넣음
     cur.execute("insert into crawl_queue(ouid) select ouid from users on conflict do nothing")
     # 등급 다양성: 지금 데이터에 적은 등급의 유저부터 수집 (한 등급에 몰리는 것 방지)
+    # 등급은 경기 기록상 실제 현재 등급을 우선 쓰고, 없으면 역대 최고 등급
+    # 우선순위: ① 최근에 경기한 유저(활동 중) ② 데이터에 적은 등급 ③ 오래 수집 안 한 유저
+    # 마지막 경기가 FRESH_DAYS보다 오래된 유저는 쉬는 유저라 1주일에 한 번만 다시 확인
     cur.execute("""
+      with tier as (
+        select u.ouid, coalesce(c.cur_division, u.max_division) as d, u.last_match_at
+        from users u left join user_cur_division c on c.ouid = u.ouid and c.match_type = %s
+      ), cnt as (select d, count(*) c from tier where d is not null group by d)
       select q.ouid from crawl_queue q
-      left join users u using (ouid)
-      left join (select max_division d, count(*) c from users
-                 where max_division is not null group by 1) t on t.d = u.max_division
-      where q.done_at is null or q.done_at < now() - interval '3 days'
-      order by (u.max_division is null), coalesce(t.c, 0), q.done_at nulls first
-      limit 200""")
+      left join tier t using (ouid)
+      left join cnt on cnt.d = t.d
+      where (q.done_at is null or q.done_at < now() - interval '1 day')
+        and (t.last_match_at is null or t.last_match_at > now() - make_interval(days => %s)
+             or q.done_at < now() - interval '7 days')
+      order by (t.last_match_at > now() - interval '3 days') desc nulls last,
+               (t.d is null), coalesce(cnt.c, 0), q.done_at nulls first
+      limit 200""", (MTYPE, FRESH_DAYS))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=FRESH_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
     for (ouid,) in cur.fetchall():
         try:
             ids = api.matches(ouid, MTYPE, limit=20)
@@ -113,16 +128,28 @@ def crawl(buffer):
             if e.status == 429:
                 raise BudgetExceeded()
             ids = []
+        latest = None
         if ids:
             cur.execute("select match_id from matches where match_id = any(%s)", (ids,))
             have = {r[0] for r in cur.fetchall()}
-            for mid in ids:
-                if mid not in have and mid not in buffer:
-                    try:
-                        buffer[mid] = api.detail(mid)
-                    except ApiError as e:
-                        if e.status == 429:
-                            raise BudgetExceeded()
+            for mid in ids:  # 넥슨 목록은 최근 경기부터 → 오래된 경기를 만나면 거기서 멈춤
+                if mid in have or mid in buffer:
+                    continue
+                try:
+                    d = api.detail(mid)
+                except ApiError as e:
+                    if e.status == 429:
+                        raise BudgetExceeded()
+                    continue
+                date = (d.get("matchDate") or "")[:19]
+                latest = max(latest or date, date)
+                if date and date < cutoff:
+                    stale_stop[0] += 1
+                    break
+                buffer[mid] = d
+        if latest:
+            cur.execute("update users set last_match_at = greatest(coalesce(last_match_at, %s), %s) "
+                        "where ouid = %s", (latest, latest, ouid))
         cur.execute("update crawl_queue set done_at=now() where ouid=%s", (ouid,))
 
 
@@ -143,7 +170,14 @@ def save(buffer):
     if cur.fetchone()[0] < QUEUE_CAP:
         cur.executemany("insert into crawl_queue(ouid) values (%s) on conflict do nothing",
                         [(o,) for o in ouids if o])
-    log("새 경기 저장:", new)
+    # 경기 기록에 나온 유저들의 '마지막 경기 시각' 갱신
+    cur.execute("""
+      update users u set last_match_at = x.t from (
+        select ms.ouid, max(m.match_date) t from match_sides ms join matches m using (match_id)
+        group by ms.ouid) x
+      where x.ouid = u.ouid and (u.last_match_at is null or u.last_match_at < x.t)""")
+    log("새 경기 저장:", new, f"(오래된 경기를 만나 수집을 멈춘 유저: {stale_stop[0]}명)")
+    stale_stop[0] = 0
     buffer.clear()
 
 
@@ -174,12 +208,14 @@ def rollup_and_purge():
              (match_date at time zone 'Asia/Seoul')::date,
              count(*), sum(gf), sum(ga), sum(xg), sum(xga)
       from side_summary where collected_at < now() - interval '28 days'
+                            or match_date < now() - interval '28 days'
       group by 1, 2, 3, 4
       on conflict (patch_id, match_type, division, day) do update set
         n_sides = patch_tier_agg.n_sides + excluded.n_sides,
         gf = patch_tier_agg.gf + excluded.gf, ga = patch_tier_agg.ga + excluded.ga,
         xg = patch_tier_agg.xg + excluded.xg, xga = patch_tier_agg.xga + excluded.xga""")
-    cur.execute("delete from matches where collected_at < now() - interval '28 days'")
+    cur.execute("delete from matches where collected_at < now() - interval '28 days' "
+                "or match_date < now() - interval '28 days'")
     log("오래된 경기 삭제:", cur.rowcount)
     cur.execute("delete from users where coalesce(refreshed_at, created_at) < now() - interval '28 days'")
     log("갱신 안 된 유저 삭제:", cur.rowcount)
