@@ -154,6 +154,25 @@ def main():
                   f"{sum(1 for d in details for s in d.get('matchInfo') or [] if s.get('division'))}"
                   f" / {sum(len(d.get('matchInfo') or []) for d in details)}\n")
 
+    # 2-1) DB에 쌓인 슈팅 전체로 같은 표 (넥슨 호출 없음, 표본이 훨씬 큼)
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        try:
+            from common import db_connect
+            with db_connect(url) as c:
+                cur = c.cursor()
+                cur.execute("""
+                  select type, count(*), round(avg((result = 3)::int) * 100, 1), round(avg(x)::numeric, 3),
+                         round(avg(y)::numeric, 3), round(avg(in_penalty::int) * 100, 1),
+                         round(stddev(x)::numeric, 3), round(stddev(y)::numeric, 3)
+                  from shots group by type order by type""")
+                rows = [dict(zip(["type", "n", "goal%", "avg_x", "avg_y", "box%", "sd_x", "sd_y"], r))
+                        for r in cur.fetchall()]
+            report.append("\n### DB에 쌓인 슈팅 전체 기준\n"
+                          "위치가 한 점에 몰리면(sd_x, sd_y가 아주 작으면) 페널티킥이에요.\n\n" + md_table(rows))
+        except Exception as e:
+            report.append(f"\nDB 슈팅 통계 실패: {type(e).__name__}\n")
+
     # 3) 시즌 메타데이터
     report.append("\n## 3. 시즌 메타데이터 (seasonid)\n")
     try:

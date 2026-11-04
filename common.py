@@ -90,6 +90,11 @@ class Nexon:
 
 
 # ================================================================ 경기 파싱
+def offsides(md):
+    """넥슨 실제 응답은 offsideCount(소문자). 예전 코드는 OffsideCount로 읽어서 항상 0이었음."""
+    return md.get("offsideCount", md.get("OffsideCount", 0)) or 0
+
+
 def goals(side):
     sh = side.get("shoot") or {}
     return sh.get("goalTotalDisplay", sh.get("goalTotal", 0)) or 0
@@ -109,7 +114,7 @@ def side_row(s, o):
         "tackle_try": df.get("tackleTry", 0), "tackle_succ": df.get("tackleSuccess", 0),
         "block_try": df.get("blockTry", 0), "block_succ": df.get("blockSuccess", 0),
         "possession": md.get("possession"), "fouls": md.get("foul", 0),
-        "offside": md.get("OffsideCount", 0), "rating": md.get("averageRating"),
+        "offside": offsides(md), "rating": md.get("averageRating"),
         "controller": md.get("controller"),
         "division": s.get("division") or None,  # 경기 당시 등급 (넥슨이 주는 경우만)
     }
