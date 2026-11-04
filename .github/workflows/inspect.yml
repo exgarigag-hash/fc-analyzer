@@ -1,0 +1,29 @@
+name: inspect
+on:
+  workflow_dispatch:          # Actions 탭에서 수동 실행만 (넥슨 호출 약 15건)
+    inputs:
+      sample_matches:
+        description: "확인할 경기 수"
+        default: "10"
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests numpy "psycopg[binary]"
+      - run: python inspect_api.py
+        env:
+          NEXON_API_KEY: ${{ secrets.NEXON_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEED_NICKNAMES: ${{ vars.SEED_NICKNAMES }}
+          SAMPLE_MATCHES: ${{ inputs.sample_matches }}
+      - uses: actions/upload-artifact@v4   # 경기 상세 원본 1개 (ouid·닉네임 가림)
+        if: always()
+        with:
+          name: sample-match
+          path: sample_match.json
+          if-no-files-found: ignore
