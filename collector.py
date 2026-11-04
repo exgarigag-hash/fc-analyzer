@@ -10,7 +10,7 @@ import os
 
 import numpy as np
 
-from common import (ApiError, BudgetExceeded, Nexon, db_connect, detect_flip, fit_logit,
+from common import (ApiError, BudgetExceeded, Nexon, db_connect, detect_flip, fit_xg,
                     latest_model, save_match)
 
 MTYPE = int(os.environ.get("MATCH_TYPE", 50))
@@ -182,23 +182,23 @@ def save(buffer):
 
 
 def retrain():
-    cur.execute("select created_at > now() - interval '20 hours', n_shots, flip "
+    cur.execute("select created_at > now() - interval '20 hours', n_shots, flip, coef ? 'type' "
                 "from xg_models order by id desc limit 1")
-    recent, n_prev, flip = cur.fetchone()
-    if recent and n_prev:  # 기본 모델이면 바로 학습
+    recent, n_prev, flip, has_type = cur.fetchone()
+    if recent and n_prev and has_type:  # 기본 모델이거나 슈팅 종류가 없는 예전 모델이면 바로 학습
         return
-    cur.execute("select dist, angle, header, (result = 3)::int from shots where dist is not null")
+    cur.execute("select dist, angle, header, type, (result = 3)::int from shots where dist is not null")
     rows = np.array(cur.fetchall(), dtype=float)
     if len(rows) < 2000:
         log("xG 재학습 보류: 슈팅", len(rows), "개 (2000개 필요)")
         return
-    X = np.column_stack([np.ones(len(rows)), rows[:, :3]])
-    w = fit_logit(X, rows[:, 3])
-    coef = {"b0": w[0], "dist": w[1], "angle": w[2], "header": w[3]}
+    coef = fit_xg(rows)
     cur.execute("select max(id) from patches")
     cur.execute("insert into xg_models(patch_id, n_shots, coef, flip) values (%s,%s,%s,%s)",
-                (cur.fetchone()[0], len(rows), json.dumps({k: float(v) for k, v in coef.items()}), flip))
-    log("xG 재학습 완료:", len(rows), "슈팅", {k: round(float(v), 3) for k, v in coef.items()})
+                (cur.fetchone()[0], len(rows), json.dumps(coef), flip))
+    log("xG 재학습 완료:", len(rows), "슈팅",
+        {k: (round(v, 3) if isinstance(v, float) else {t: round(c, 2) for t, c in v.items()})
+         for k, v in coef.items()})
 
 
 def rollup_and_purge():

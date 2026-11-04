@@ -146,3 +146,43 @@ def test_offsides_reads_real_field_name():
     assert offsides({"OffsideCount": 2}) == 2   # 예전 이름도 계속 읽음
     assert offsides({}) == 0
     assert side_row({"matchDetail": {"offsideCount": 4}}, {})["offside"] == 4
+
+
+def test_xg_penalty_fixed_and_type_offset():
+    from common import PENALTY_TYPE
+    coef = {**DEFAULT_COEF, "type": {"3": -1.0}, "penalty": 0.74}
+    pen = {"x": 0.3, "y": 0.9, "type": PENALTY_TYPE}          # 좌표가 이상해도 고정값
+    normal, head = {"x": 0.93, "y": 0.5, "type": 1}, {"x": 0.93, "y": 0.5, "type": 3}
+    xs = xg_values([pen, normal, head], coef)
+    assert math.isclose(xs[0], 0.74) and xs[2] < xs[1]
+
+
+def test_xg_old_model_without_type_keys_still_works():
+    old = {"b0": -0.5, "dist": -0.11, "angle": 1.3, "header": -0.8}
+    xs = xg_values([{"x": 0.9, "y": 0.5, "type": 9}, {"x": 0.9, "y": 0.5, "type": 3}], old)
+    assert ((xs > 0) & (xs < 1)).all() and xs[1] < xs[0]      # 예전 방식: 헤딩만 보정, 페널티 고정 없음
+
+
+def test_fit_xg_learns_types_and_penalty():
+    from common import fit_xg
+    rng = np.random.default_rng(0)
+    rows = []
+    for _ in range(6000):
+        t = rng.choice([1, 3, 8, 13], p=[.6, .2, .1, .1])
+        d = rng.uniform(5, 30)
+        p = 1 / (1 + np.exp(-(1.5 - 0.12 * d + {1: 0, 3: -1.0, 8: -1.5, 13: 0}[t])))
+        rows.append((d, 0.5, int(t == 3), t, rng.uniform() < p))
+    rows += [(11, 0.6, 0, 9, rng.uniform() < 0.75) for _ in range(400)]
+    rows += [(15, 0.5, 0, 12, 1) for _ in range(20)]               # 드문 종류 → 보정 안 함
+    c = fit_xg(rows)
+    assert abs(c["penalty"] - 0.75) < 0.07
+    assert c["dist"] < 0 and abs(c["type"]["3"] + 1.0) < 0.3 and abs(c["type"]["8"] + 1.5) < 0.4
+    assert "12" not in c["type"] and "1" not in c["type"] and "9" not in c["type"]
+
+
+def test_calibrate_leaves_penalties_fixed():
+    shots = [{"x": 0.93, "y": 0.5, "type": 1, "result": 3 if i % 2 else 1} for i in range(100)]
+    shots += [{"x": 0.9, "y": 0.5, "type": 9, "result": 3} for _ in range(10)]
+    c = calibrate(DEFAULT_COEF, shots)
+    xs = xg_values(shots, c)
+    assert math.isclose(xs[-1], 0.74) and abs(xs.sum() - 60) < 0.5
