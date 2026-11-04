@@ -26,6 +26,9 @@ create table if not exists matches (
   match_date timestamptz,
   collected_at timestamptz default now()
 );
+-- 28일 지난 경기 삭제·최근 경기 조회용
+create index if not exists matches_date on matches(match_date);
+create index if not exists matches_collected on matches(collected_at);
 
 create table if not exists match_sides (
   match_id text references matches on delete cascade,
@@ -49,6 +52,8 @@ create table if not exists shots (
   dist real, angle real, header int
 );
 create index if not exists shots_match on shots(match_id);
+-- side_summary가 경기·유저별 xG를 더할 때 쓰는 인덱스 (등급 비교 쿼리 속도)
+create index if not exists shots_match_ouid on shots(match_id, ouid);
 -- 어시스트 위치 (공격·실점 루트 분석용)
 alter table shots add column if not exists assisted boolean;
 alter table shots add column if not exists assist_x real;

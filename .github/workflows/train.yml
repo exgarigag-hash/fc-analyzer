@@ -3,6 +3,9 @@ on:
   schedule:
     - cron: "0 19 * * *"   # 매일 한국 시간 새벽 4시
   workflow_dispatch:
+concurrency:          # 이전 실행이 안 끝났으면 겹쳐 돌지 않게
+  group: train
+  cancel-in-progress: false
 jobs:
   train:
     runs-on: ubuntu-latest

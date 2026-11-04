@@ -42,19 +42,21 @@ def classify_route(s, flip=False):
 
 
 def route_table(shots, coef, flip, n_matches):
-    """루트별 슈팅 비중, 경기당 슈팅·골·xG, 슈팅당 xG."""
+    """루트별 슈팅 비중, 경기당 슈팅·골·xG, 슈팅당 xG.
+    반환: (표, 분류 가능한 슈팅 비율). 예전엔 비율을 함수 속성에 넣었는데,
+    여러 사용자가 동시에 쓰면 서로 값을 덮어써서 반환값으로 바꿈."""
     if not shots:
-        return pd.DataFrame()
+        return pd.DataFrame(), 0.0
     xs = xg_values(shots, coef, flip)
     df = pd.DataFrame({"route": [classify_route(s, flip) for s in shots], "xg": xs,
                        "goal": [s.get("result") == 3 for s in shots]})
     # 어시스트 정보가 있는 슈팅만 사용 (박스 밖 슈팅도 같은 기준으로 걸러야 비중이 안 틀어짐)
     known = pd.Series([has_assist(s) is not None for s in shots]).values
-    route_table.coverage = float(known.mean()) if len(df) else 0.0  # 분류 가능한 슈팅 비율
+    coverage = float(known.mean()) if len(df) else 0.0  # 분류 가능한 슈팅 비율
     if known.sum() < 20:
-        return pd.DataFrame()
+        return pd.DataFrame(), coverage
     df = df[known]
-    n_matches = n_matches * route_table.coverage  # 분류 가능한 슈팅이 나온 경기 수로 환산
+    n_matches = n_matches * coverage  # 분류 가능한 슈팅이 나온 경기 수로 환산
     g = df.groupby("route").agg(shots=("xg", "size"), xg=("xg", "sum"), goals=("goal", "sum"))
     g = g.reindex(list(ROUTES), fill_value=0)
     out = pd.DataFrame({
@@ -66,7 +68,7 @@ def route_table(shots, coef, flip, n_matches):
         "슈팅당 xG": g.xg / g.shots.replace(0, np.nan),
         "골 − xG (경기당)": (g.goals - g.xg) / n_matches,
     }, index=g.index)
-    return out
+    return out, coverage
 
 
 def route_insights(att, dfd, pop_share=None):
@@ -158,6 +160,8 @@ def flows_from_details(details, ouid):
         me = next((x for x in info if x.get("ouid") == ouid), None)
         if me is None or len(info) != 2:
             continue
+        if (me.get("matchDetail") or {}).get("matchEndType", 0) != 0:
+            continue  # 몰수승/몰수패는 흐름 분석에서도 제외 (다른 분석과 기준 통일)
         op = info[1] if info[0] is me else info[0]
         gm = lambda side: [goal_minute(s.get("goalTime", 0)) for s in side.get("shootDetail") or []
                            if s.get("result") == 3 and (s.get("goalTime", 0) >> 24) < 4]

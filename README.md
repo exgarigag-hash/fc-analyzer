@@ -6,6 +6,7 @@
 - collector.py : 자동 수집기
 - schema.sql : 데이터베이스 설계 (Supabase에서 한 번 실행)
 - .github/workflows/collect.yml : 3시간마다 수집기를 돌리는 설정
+- tests/ : 계산 함수 테스트 (`python -m pytest -q`, 푸시할 때마다 test.yml이 자동 실행)
 
 ## 분석 방식
 - 진단: xG(기대 득점)로 득실을 찬스 창출 / 결정력 / 수비 조직 / 막판 방어로 분해
