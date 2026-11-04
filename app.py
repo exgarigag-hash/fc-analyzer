@@ -21,7 +21,7 @@ import streamlit as st
 import deep
 from common import FEATURE_INFO, FEATURES, PLAYER_FIELDS, match_features, side_row
 from common import (DEFAULT_COEF, HEADER_TYPE, ApiError, calibrate, db_connect, detect_flip,
-                    goal_minute, goals, latest_model, save_match, xg_values)
+                    goal_minute, goals, latest_model, offsides, save_match, xg_values)
 
 BASE = "https://open.api.nexon.com"
 QUICK_N = 10  # 스카우팅 카드용 경기 수
@@ -252,7 +252,7 @@ def side_metrics(s, o):
         "head_share": sdiv(sh.get("shootHeading", 0), shots),
         "long_share": sdiv(ps.get("longPassTry", 0), ptry),
         "through_try": ps.get("throughPassTry", 0),
-        "offside": md.get("OffsideCount", 0),
+        "offside": offsides(md),
     }
 
 
@@ -620,7 +620,7 @@ def tier_table(mtype):
 # ---------------------------------------------------------------- DB에서 경기 꺼내 쓰기 (넥슨 호출 절약)
 SIDE_MAP = {  # DB 열 → 넥슨 응답 구조
     "matchDetail": {"matchResult": "result", "possession": "possession", "foul": "fouls",
-                    "averageRating": "rating", "OffsideCount": "offside", "controller": "controller"},
+                    "averageRating": "rating", "offsideCount": "offside", "controller": "controller"},
     "shoot": {"shootTotal": "shots", "effectiveShootTotal": "sot", "goalTotal": "gf",
               "goalTotalDisplay": "gf", "shootInPenalty": "shots_box", "shootHeading": "shots_head"},
     "pass": {"passTry": "pass_try", "passSuccess": "pass_succ", "throughPassTry": "through_try",

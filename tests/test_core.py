@@ -138,3 +138,11 @@ def test_segment_diff():
 
 def test_pos_group():
     assert [deep.pos_group(p) for p in (0, 5, 14, 25)] == ["GK", "DF", "MF", "FW"]
+
+
+def test_offsides_reads_real_field_name():
+    from common import offsides, side_row
+    assert offsides({"offsideCount": 3}) == 3
+    assert offsides({"OffsideCount": 2}) == 2   # 예전 이름도 계속 읽음
+    assert offsides({}) == 0
+    assert side_row({"matchDetail": {"offsideCount": 4}}, {})["offside"] == 4
