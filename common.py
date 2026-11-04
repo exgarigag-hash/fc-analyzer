@@ -135,8 +135,15 @@ def goal_minute(gt):
 
 # ================================================================ xG (기대 득점)
 PITCH_L, PITCH_W, GOAL_W = 105.0, 68.0, 7.32
-HEADER_TYPE = 3  # shootDetail.type 중 헤딩 코드 (넥슨 문서 기준, 다르면 여기만 수정)
-DEFAULT_COEF = {"b0": -0.5, "dist": -0.11, "angle": 1.3, "header": -0.8}
+# shootDetail.type 코드 (DB 슈팅 약 11.8만 개로 확인: inspect 워크플로 결과)
+HEADER_TYPE = 3    # 헤딩: 99.6%가 박스 안
+FREEKICK_TYPE = 8  # 직접 프리킥: 박스 안 1%, 좌우로 넓게 퍼짐, 골 확률 9%
+PENALTY_TYPE = 9   # 페널티킥: 위치가 한 점(표준편차 0.002), 골 확률 74%
+# coef["type"]: 슈팅 종류별 보정값 (로그 오즈, 1번 일반 슈팅이 기준 0)
+# coef["penalty"]: 페널티킥은 위치와 상관없이 이 확률로 고정
+DEFAULT_COEF = {"b0": -0.5, "dist": -0.11, "angle": 1.3, "header": -0.8,
+                "type": {}, "penalty": 0.74}
+MIN_TYPE_SHOTS = 200  # 이보다 적은 슈팅 종류는 따로 보정하지 않음 (일반 슈팅과 같게)
 
 
 def has_assist(s):
@@ -173,12 +180,44 @@ def detect_flip(shots):
     return bool(xs) and float(np.mean(xs)) < 0.5
 
 
+def _is_penalty(s, coef):
+    return s.get("type") == PENALTY_TYPE and coef.get("penalty") is not None
+
+
 def xg_values(shots, coef, flip=False):
+    """슈팅별 xG. 거리·각도 + 슈팅 종류 보정, 페널티킥은 고정값.
+    예전 모델(type/penalty 키 없음)도 그대로 계산됨."""
     if not shots:
         return np.zeros(0)
     f = np.array([shot_features(s, flip) for s in shots])
-    z = coef["b0"] + coef["dist"] * f[:, 0] + coef["angle"] * f[:, 1] + coef["header"] * f[:, 2]
-    return 1 / (1 + np.exp(-z))
+    tcoef = coef.get("type") or {}
+    t = np.array([float(tcoef.get(str(s.get("type")), 0.0)) for s in shots])
+    z = (coef["b0"] + coef["dist"] * f[:, 0] + coef["angle"] * f[:, 1]
+         + coef.get("header", 0.0) * f[:, 2] + t)
+    p = 1 / (1 + np.exp(-z))
+    pen = np.array([_is_penalty(s, coef) for s in shots])
+    if pen.any():
+        p[pen] = float(coef["penalty"])
+    return p
+
+
+def fit_xg(rows, l2=1.0, min_type=MIN_TYPE_SHOTS):
+    """슈팅 기록으로 xG 모델 학습. rows: (dist, angle, header, type, goal) 배열.
+    - 페널티킥은 회귀에서 빼고 실제 성공률을 고정값으로 씀
+    - 슈팅이 min_type개 이상인 종류마다 보정값을 따로 학습 (헤딩도 여기서 처리)"""
+    rows = np.asarray(rows, dtype=float)
+    types = rows[:, 3]
+    pen = types == PENALTY_TYPE
+    n_pen = int(pen.sum())
+    penalty = float(rows[pen, 4].mean()) if n_pen >= 30 else DEFAULT_COEF["penalty"]
+    r = rows[~pen]
+    t = r[:, 3]
+    vals, cnt = np.unique(t[~np.isnan(t)], return_counts=True)
+    own = [int(v) for v, c in zip(vals, cnt) if c >= min_type and int(v) != 1]
+    X = np.column_stack([np.ones(len(r)), r[:, 0], r[:, 1]] + [(t == v).astype(float) for v in own])
+    w = fit_logit(X, r[:, 4], l2=l2)
+    return {"b0": float(w[0]), "dist": float(w[1]), "angle": float(w[2]), "header": 0.0,
+            "type": {str(v): float(c) for v, c in zip(own, w[3:])}, "penalty": penalty}
 
 
 def calibrate(coef, shots, flip=False):
@@ -187,9 +226,10 @@ def calibrate(coef, shots, flip=False):
     if len(shots) < 50 or goals_n == 0:
         return dict(coef)
     c = dict(coef)
+    free = np.array([not _is_penalty(s, c) for s in shots])  # 페널티킥은 고정값이라 조정 대상 아님
     for _ in range(30):
         p = xg_values(shots, c, flip)
-        f, fp = p.sum() - goals_n, (p * (1 - p)).sum()
+        f, fp = p.sum() - goals_n, (p * (1 - p))[free].sum()
         if fp <= 0 or abs(f) < 1e-3:
             break
         c["b0"] -= f / fp

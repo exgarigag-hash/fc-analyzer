@@ -131,10 +131,15 @@ select m.*,
     order by p.start_date desc limit 1) as patch_id
 from matches m;
 
+-- xG = 거리·각도 + 슈팅 종류 보정 (coef.type), 페널티킥(type 9)은 고정값 (coef.penalty)
+-- 예전 모델(type/penalty 키 없음)이면 거리·각도·헤딩만으로 계산
 create or replace view shot_xg as
 select s.match_id, s.ouid, s.in_penalty, s.result,
-  1 / (1 + exp(-((c.coef->>'b0')::float8 + (c.coef->>'dist')::float8 * s.dist
-               + (c.coef->>'angle')::float8 * s.angle + (c.coef->>'header')::float8 * s.header))) as xg
+  case when s.type = 9 and c.coef ? 'penalty' then (c.coef->>'penalty')::float8
+  else 1 / (1 + exp(-((c.coef->>'b0')::float8 + (c.coef->>'dist')::float8 * s.dist
+               + (c.coef->>'angle')::float8 * s.angle
+               + coalesce((c.coef->>'header')::float8, 0) * s.header
+               + coalesce((c.coef->'type'->>s.type::text)::float8, 0)))) end as xg
 from shots s
 cross join (select coef from xg_models order by id desc limit 1) c;
 
