@@ -5,6 +5,7 @@ FC 온라인 전력분석실
 데이터: 넥슨 Open API (https://openapi.nexon.com)
 실행: streamlit run app.py
 """
+import html
 import json
 import os
 import threading
@@ -18,9 +19,9 @@ import requests
 import streamlit as st
 
 import deep
-from common import FEATURE_INFO, FEATURES, match_features, side_row
-from common import (DEFAULT_COEF, HEADER_TYPE, calibrate, db_connect, detect_flip,
-                    latest_model, save_match, xg_values)
+from common import FEATURE_INFO, FEATURES, PLAYER_FIELDS, match_features, side_row
+from common import (DEFAULT_COEF, HEADER_TYPE, ApiError, calibrate, db_connect, detect_flip,
+                    goal_minute, goals, latest_model, save_match, xg_values)
 
 BASE = "https://open.api.nexon.com"
 QUICK_N = 10  # 스카우팅 카드용 경기 수
@@ -28,10 +29,17 @@ st.set_page_config(page_title="FC 전력분석실", page_icon="⚽", layout="wid
 
 
 # ================================================================ API
-class ApiError(Exception):
-    def __init__(self, msg, status=None):
-        super().__init__(msg)
-        self.status = status
+LIMIT_COOLDOWN = 600  # 한도 초과 후 이 시간(초)이 지나면 넥슨 호출을 다시 시도
+
+
+def api_exhausted():
+    """한도 초과 표시가 세션 내내 남아 다음 날에도 API를 안 부르는 문제 방지."""
+    t = st.session_state.get("api_exhausted_at")
+    return bool(t) and time.time() - t < LIMIT_COOLDOWN
+
+
+def mark_exhausted():
+    st.session_state.api_exhausted_at = time.time()
 
 
 def _get(path, params, key):
@@ -88,7 +96,7 @@ def fetch_details(ids, key, label):
     if todo:  # DB에 저장된 경기는 넥슨 호출 없이 꺼내 씀
         store.update(details_from_db(tuple(todo)))
         todo = [m for m in todo if m not in store]
-    if todo and not st.session_state.get("api_exhausted"):
+    if todo and not api_exhausted():
         bar = st.progress(0.0, text=label)
 
         def work(mid):
@@ -102,7 +110,7 @@ def fetch_details(ids, key, label):
             for i, f in enumerate(as_completed(futs), 1):
                 mid, d = f.result()
                 if d == "LIMIT":
-                    st.session_state.api_exhausted = True
+                    mark_exhausted()
                 elif d:
                     store[mid] = d
                 bar.progress(i / len(todo), text=f"{label} ({i}/{len(todo)})")
@@ -216,11 +224,6 @@ def sdiv(a, b):
     return a / b * 100 if b else np.nan
 
 
-def goals(side):
-    sh = side.get("shoot") or {}
-    return sh.get("goalTotalDisplay", sh.get("goalTotal", 0)) or 0
-
-
 def side_metrics(s, o):
     md = s.get("matchDetail") or {}
     sh = s.get("shoot") or {}
@@ -275,12 +278,6 @@ def compare(me, bm):
     return pd.DataFrame(out)
 
 
-def goal_minute(gt):
-    period, sec = gt >> 24, (gt & 0xFFFFFF) / 60
-    base = {0: 0, 1: 45, 2: 90, 3: 105}.get(period, 120)
-    return sec if sec >= base else base + sec
-
-
 BINS = [-1, 15, 30, 45, 60, 75, 90, 200]
 BIN_LABELS = ["0-15분", "16-30분", "31-45분", "46-60분", "61-75분", "76-90분", "90분+"]
 
@@ -333,7 +330,7 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
                 return f"경기 목록을 불러오지 못했어요. API 키와 경기 종류를 확인하세요. ({e})"
             offline = True
     if offline:  # 한도 소진 → DB에 쌓인 경기로 분석
-        st.session_state.api_exhausted = True
+        mark_exhausted()
         ids = db_match_ids(ouid, mtype, n)
         if len(ids) < 3:
             return (f"오늘 넥슨 API 한도를 다 썼고, DB에 '{nick}'의 경기가 {len(ids)}개뿐이라 분석이 어려워요. "
@@ -351,7 +348,7 @@ def analyze(nick, mtype, n, key, label="경기 기록 불러오는 중"):
     max_div, max_date = best.get("division"), (best.get("achievementDate") or "")[:10]
     opp_ouids = tuple(sorted({x.get("ouid") for d in details for x in d.get("matchInfo") or []
                               if x.get("ouid") != ouid}))
-    est_div, n_opp = estimate_tier(opp_ouids)
+    est_div, n_opp = estimate_tier(opp_ouids, mtype)
     # 경기 기록에 경기 당시 등급이 있으면 그게 가장 정확 (최근 경기 기준)
     recent_divs = [x.get("division") for d in sorted(details, key=lambda d: d.get("matchDate", ""), reverse=True)[:10]
                    for x in d.get("matchInfo") or [] if x.get("ouid") == ouid and x.get("division")]
@@ -459,6 +456,10 @@ def fmt(v):
     return "-" if pd.isna(v) else f"{v:.1f}"
 
 
+def esc(v):
+    return html.escape(str(v))
+
+
 
 # ================================================================ DB (선택: 없으면 앱만 단독 동작)
 def _secret(name):
@@ -530,13 +531,12 @@ def db_save(details, ouid):
 
     def work():
         try:
-            conn = db_connect(url)
-            cur = conn.cursor()
-            for d in todo:
-                save_match(cur, d, flip)
-                done.add(d.get("matchId"))
-            cur.execute("insert into crawl_queue(ouid) values (%s) on conflict do nothing", (ouid,))
-            conn.close()
+            with db_connect(url) as conn:  # 중간에 실패해도 접속은 항상 닫힘
+                cur = conn.cursor()
+                for d in todo:
+                    save_match(cur, d, flip)
+                    done.add(d.get("matchId"))
+                cur.execute("insert into crawl_queue(ouid) values (%s) on conflict do nothing", (ouid,))
         except Exception:
             pass
 
@@ -576,7 +576,7 @@ def tier_population(mtype, division):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def estimate_tier(opp_ouids):
+def estimate_tier(opp_ouids, mtype):
     """추정 현재 등급 = 최근 상대들의 등급 중앙값 (매칭은 비슷한 실력끼리 잡히니까).
     최고 등급을 90일 안에 찍은 상대가 5명 이상이면 그 상대들만 씀 (예전 시즌 기록 제외)."""
     cur = cursor()
@@ -588,12 +588,12 @@ def estimate_tier(opp_ouids):
             select u.ouid,
                    coalesce(c.cur_division, u.max_division) as d,
                    (c.cur_division is not null or u.max_division_date > now() - interval '90 days') as recent
-            from users u left join user_cur_division c on c.ouid = u.ouid and c.match_type = 50
+            from users u left join user_cur_division c on c.ouid = u.ouid and c.match_type = %s
             where u.ouid = any(%s))
           select percentile_disc(0.5) within group (order by d) filter (where recent),
                  count(*) filter (where recent),
                  percentile_disc(0.5) within group (order by d), count(*)
-          from t where d is not null""", (list(opp_ouids),))
+          from t where d is not null""", (mtype, list(opp_ouids)))
         v_recent, n_recent, v_all, n_all = cur.fetchone()
         if n_recent >= 5:
             return v_recent, n_recent
@@ -657,7 +657,6 @@ def details_from_db(match_ids):
                  "assistX": ax, "assistY": ay})
         players = {}
         try:
-            from common import PLAYER_FIELDS
             cols = ["match_id", "ouid", "sp_id", "sp_position", "sp_grade", *PLAYER_FIELDS.values()]
             cur.execute(f"select {','.join(cols)} from player_stats where match_id = any(%s)", (list(ms),))
             for r in cur.fetchall():
@@ -1026,9 +1025,9 @@ def scout_card(opp, mine=None):
     me = opp["me"]
     w, dr = (me.result == "승").sum(), (me.result == "무").sum()
     l = len(me) - w - dr
-    head = f"{opp['nick']} · 최근 {len(me)}경기 {w}승 {dr}무 {l}패"
+    head = f"{esc(opp['nick'])} · 최근 {len(me)}경기 {w}승 {dr}무 {l}패"
     if opp["controller"]:
-        head += f" · {opp['controller']}"
+        head += f" · {esc(opp['controller'])}"
 
     rows = [f'<div class="sc-row"><span class="sc-tag sc-go">공략</span>{attack}</div>',
             f'<div class="sc-row"><span class="sc-tag sc-no">주의</span>{caution}</div>']
@@ -1197,17 +1196,18 @@ def render_full(r, mode):
 
 # ================================================================ 심층 분석 화면
 @st.cache_data(ttl=3600, show_spinner=False)
-def pop_flow():
-    """DB에 쌓인 전체 공식경기로 계산한 경기 흐름 평균."""
+def pop_flow(mtype):
+    """DB에 쌓인 전체 경기(같은 경기 종류)로 계산한 경기 흐름 평균.
+    mtype을 인자로 받아야 캐시가 경기 종류별로 따로 저장됨."""
     cur = cursor()
     if cur is None:
         return None
     try:
         cur.execute("select s.match_id, s.ouid, s.goal_time from shots s join matches m using (match_id) "
-                    "where s.result = 3 and m.match_type = %s", (st.session_state.mtype,))
+                    "where s.result = 3 and m.match_type = %s", (mtype,))
         goals = pd.DataFrame(cur.fetchall(), columns=["match_id", "ouid", "goal_time"])
         cur.execute("select ms.match_id, ms.ouid, ms.result from match_sides ms join matches m using (match_id) "
-                    "where m.match_type = %s", (st.session_state.mtype,))
+                    "where m.match_type = %s", (mtype,))
         sides = pd.DataFrame(cur.fetchall(), columns=["match_id", "ouid", "result"])
         if len(sides) < 400:
             return None
@@ -1254,9 +1254,8 @@ def render_deep(r, mode="self"):
     st.caption("슈팅 위치와 어시스트 위치로 찬스가 어떤 길로 만들어졌는지 분류했어요. "
                "측면 크로스 / 컷백(골라인 근처에서 뒤로 내준 패스) / 침투 패스 / 박스 근처 연계 / "
                "개인 돌파·세컨볼(어시스트 없음) / 중거리(박스 밖)")
-    att = deep.route_table(r["me_shots"], coef, flip, n)
-    cov = getattr(deep.route_table, "coverage", 1.0)
-    dfd = deep.route_table(r["op_shots"], coef, flip, n)
+    att, cov = deep.route_table(r["me_shots"], coef, flip, n)
+    dfd, _ = deep.route_table(r["op_shots"], coef, flip, n)
     pop = pop_route_share(flip)
     if cov < 0.95:
         st.info(f"슈팅 중 {cov * 100:.0f}%만 어시스트 정보가 있어서 그 슈팅들로만 루트를 분류했어요. "
@@ -1286,7 +1285,7 @@ def render_deep(r, mode="self"):
     # ---- 2. 흐름
     st.subheader(f"② {who}경기 흐름")
     mine = deep.flow_summary(deep.flows_from_details(r["details"], r["ouid"]))
-    popf = pop_flow()
+    popf = pop_flow(st.session_state.mtype)
     if not mine:
         st.write("흐름을 계산할 경기가 없어요.")
     else:
@@ -1529,6 +1528,7 @@ def eb_estimate(x, pop, col):
     """경험적 베이즈: 경기 수가 적을수록 등급 평균 쪽으로 당겨서 '진짜 실력'을 추정."""
     n_i, m_i, v_i = pop[:, 0], pop[:, col], np.nan_to_num(pop[:, col + 1], nan=0.0)
     sigma2 = float(np.sum((n_i - 1) * v_i) / max(np.sum(n_i - 1), 1))  # 경기마다 흔들리는 정도
+    sigma2 = max(sigma2, 1e-6)  # 분산이 0이면 0으로 나누기 방지
     mu = float(np.mean(m_i))
     tau2 = max(float(np.var(m_i, ddof=1) - np.mean(sigma2 / n_i)), 0.02 * float(np.var(m_i, ddof=1)) + 1e-6)
     n = len(x)
@@ -1539,13 +1539,13 @@ def eb_estimate(x, pop, col):
 
 
 @st.cache_resource(show_spinner=False)
-def load_ml(_version):
+def load_ml(version):
     cur = cursor()
     if cur is None:
         return None
     try:
         import lightgbm as lgb
-        cur.execute("select id, metrics, baseline, model from ml_models where id = %s", (_version,))
+        cur.execute("select id, metrics, baseline, model from ml_models where id = %s", (version,))
         row = cur.fetchone()
         if not row:
             return None
@@ -1556,14 +1556,14 @@ def load_ml(_version):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def ml_status():
+def ml_status(mtype=50):
     cur = cursor()
     if cur is None:
         return None, 0
     try:
         cur.execute("select max(id) from ml_models")
         mid = cur.fetchone()[0]
-        cur.execute("select count(*) from matches where match_type = 50")
+        cur.execute("select count(*) from matches where match_type = %s", (mtype,))
         return mid, cur.fetchone()[0]
     except Exception:
         return None, 0
@@ -1581,11 +1581,31 @@ def user_divisions(ouids):
         return {}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def side_divisions(match_ids):
+    """경기·유저별 비교 등급 (학습 때 쓰는 side_summary.division과 같은 기준)."""
+    cur = cursor()
+    if cur is None or not match_ids:
+        return {}
+    try:
+        cur.execute("select ms.match_id, ms.ouid, case when ms.division > 0 then ms.division "
+                    "when u.max_division_date > now() - interval '90 days' then u.max_division "
+                    "when e.n_opp >= 5 then e.est_division else u.max_division end "
+                    "from match_sides ms join matches m using (match_id) "
+                    "left join users u on u.ouid = ms.ouid "
+                    "left join user_est_division e on e.ouid = ms.ouid and e.match_type = m.match_type "
+                    "where ms.match_id = any(%s)", (list(match_ids),))
+        return {(a, b): c for a, b, c in cur.fetchall() if c is not None}
+    except Exception:
+        return {}
+
+
 def user_feature_frame(r):
     """분석 대상의 경기마다 학습 때와 같은 방식으로 특징을 만듦."""
     opp_ids = tuple(sorted({x.get("ouid") for d in r["details"] for x in d.get("matchInfo") or []
                             if x.get("ouid") != r["ouid"]}))
     odiv = user_divisions(opp_ids)
+    sdiv_ = side_divisions(tuple(sorted(d.get("matchId") for d in r["details"] if d.get("matchId"))))
     rows, meta_rows = [], []
     for d in r["details"]:
         info = d.get("matchInfo") or []
@@ -1594,7 +1614,10 @@ def user_feature_frame(r):
             continue
         op = info[1] if info[0] is me else info[0]
         a, b = side_row(me, op), side_row(op, me)
-        rows.append(match_features(a, b, r.get("division"), odiv.get(op.get("ouid"))))
+        mid = d.get("matchId")
+        my_div = sdiv_.get((mid, r["ouid"])) or me.get("division") or r.get("division")
+        opp_div = sdiv_.get((mid, op.get("ouid"))) or op.get("division") or odiv.get(op.get("ouid"))
+        rows.append(match_features(a, b, my_div, opp_div))
         meta_rows.append({"date": d.get("matchDate", "")[:10], "opp": op.get("nickname"),
                           "score": f"{a['gf']}:{a['ga']}", "result": a["result"]})
     return pd.DataFrame(rows, columns=FEATURES).astype(float), pd.DataFrame(meta_rows)
@@ -1641,7 +1664,9 @@ def render_complex(r):
 
     # ---- 2. 머신러닝 기여도
     st.subheader("② 승률 요인 분해 (머신러닝)")
-    mid, n_matches = ml_status()
+    mid, n_matches = ml_status(50)
+    if st.session_state.mtype != 50:
+        st.info("복합분석 모델은 공식경기 데이터로만 학습해요. 다른 경기 종류에서는 참고용으로만 보세요.")
     ml = load_ml(mid) if mid else None
     if ml is None:
         st.write(f"복합분석 모델은 공식경기 5,000경기가 모이면 매일 새벽 자동으로 학습돼요 "

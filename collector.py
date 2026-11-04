@@ -202,6 +202,13 @@ def retrain():
 
 
 def rollup_and_purge():
+    # 집계 저장과 삭제를 한 트랜잭션으로 묶음: 집계만 되고 삭제가 실패하면
+    # 다음 실행 때 같은 경기가 또 집계돼서 숫자가 두 배가 되는 문제 방지
+    with conn.transaction():
+        _rollup_and_purge()
+
+
+def _rollup_and_purge():
     cur.execute("""
       insert into patch_tier_agg(patch_id, match_type, division, day, n_sides, gf, ga, xg, xga)
       select coalesce(patch_id, 0), match_type, coalesce(division, 0),
